@@ -1,0 +1,547 @@
+From bed9d8ef6cc413e4cda7bae9f73f7ceb9ebfd1a6 Mon Sep 17 00:00:00 2001
+From: TAK DM fix <tak-dm-fix@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 10:17:52 -0400
+Subject: [PATCH] TAK: route GeoChat DMs to the recipient instead of the whole
+ mesh
+
+The local TAK bridge sent every CoT to the mesh broadcast address and
+forwarded every received TAK packet to the local ATAK, so a direct
+message showed up in every user's DMs.
+
+- Send: when all addressees of a directed event (__chat id / <marti>
+  dests) map to one known mesh node, send it to that node. Firmware only
+  delivers broadcast or to-us packets to the phone, so other phones never
+  see it, and 2.5+ firmware PKI-encrypts it to the recipient. Payloads
+  over 210 B stay broadcast (PKI adds 12 B and firmware rejects
+  TOO_LARGE rather than falling back).
+- Receive: drop directed events addressed to someone other than the
+  local ATAK user. Fails open when anything is unknown.
+- Peers learned from mesh PLI / GeoChat (packet.from + uid/callsign),
+  30-minute TTL, bounded table.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01YNdppB9cmN2Z3ecoU69yUA
+---
+ .../meshtastic/core/takserver/TAKDefaults.kt  |   8 +
+ .../core/takserver/TAKMeshIntegration.kt      |  55 +++++-
+ .../core/takserver/TakDirectedRouting.kt      | 179 ++++++++++++++++++
+ .../core/takserver/TakV2Compressor.kt         |   6 +
+ .../core/takserver/TakDirectedRouterTest.kt   | 173 +++++++++++++++++
+ 5 files changed, 415 insertions(+), 6 deletions(-)
+ create mode 100644 core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakDirectedRouting.kt
+ create mode 100644 core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/TakDirectedRouterTest.kt
+
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKDefaults.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKDefaults.kt
+index a4deef2..3eeb607 100644
+--- a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKDefaults.kt
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKDefaults.kt
+@@ -71,6 +71,14 @@ internal const val TAK_DIRECT_MESSAGE_PARTS_MIN = 3
+  */
+ internal const val MAX_TAK_WIRE_PAYLOAD_BYTES = 225
+ 
++/**
++ * Largest v2 payload sent unicast to a single node. Firmware PKI-encrypts unicast packets when it has the recipient's
++ * key, adding MESHTASTIC_PKC_OVERHEAD (12 bytes) and returning TOO_LARGE instead of falling back to channel
++ * encryption. ~228 − 12 ≈ 216 bytes are available; 210 keeps a margin. Larger directed packets stay broadcast and rely
++ * on the receive-side filter in [TakDirectedRouter].
++ */
++internal const val MAX_UNICAST_TAK_WIRE_PAYLOAD_BYTES = 210
++
+ /** Default CoT type for PLI (Position Location Information) — friendly ground unit. */
+ internal const val DEFAULT_PLI_COT_TYPE = "a-f-G-U-C"
+ 
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKMeshIntegration.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKMeshIntegration.kt
+index c27ac6f..1bbf4b2 100644
+--- a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKMeshIntegration.kt
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKMeshIntegration.kt
+@@ -114,6 +114,10 @@ class TAKMeshIntegration(
+     // from the single meshPacketFlow collector coroutine (handleMeshPacket), so no locking.
+     private val deliveryDedup = CotDeliveryDedup()
+ 
++    // Directed routing for DMs / receipts / TAK-Talk: unicast to the recipient's node when known,
++    // and drop directed traffic addressed to someone else on receive. See TakDirectedRouter.
++    private val directedRouter = TakDirectedRouter()
++
+     fun start(scope: CoroutineScope) {
+         if (!isRunning.compareAndSet(expect = false, update = true)) return
+ 
+@@ -143,6 +147,7 @@ class TAKMeshIntegration(
+                             } else {
+                                 cotMessage
+                             }
++                        learnLocalIdentity(cotMessage, clientInfo)
+                         sendCoTToMesh(enriched)
+                     }
+                 },
+@@ -295,15 +300,16 @@ class TAKMeshIntegration(
+             }
+ 
+         return try {
++            val destination = resolveV2Destination(wirePayload)
+             val dataPacket =
+                 DataPacket(
+-                    to = NodeAddress.ID_BROADCAST,
++                    to = destination,
+                     bytes = wirePayload.toByteString(),
+                     dataType = PortNum.ATAK_PLUGIN_V2.value,
+                     channel = takPrefs.takServerChannel.value,
+                 )
+             commandSender.sendData(dataPacket)
+-            Logger.d { "Sent V2 to mesh: ${cotMessage.type} (${wirePayload.size} bytes)" }
++            Logger.d { "Sent V2 to mesh: ${cotMessage.type} (${wirePayload.size} bytes) to=$destination" }
+             TakSendOutcome.Sent(wirePayload.size)
+         } catch (e: CancellationException) {
+             throw e
+@@ -366,6 +372,35 @@ class TAKMeshIntegration(
+         }
+     }
+ 
++    /**
++     * Pick the mesh destination for an outbound v2 packet: the recipient's node for directed traffic whose addressees
++     * all sit behind one known node, otherwise broadcast. Decodes our own wire payload so the decision uses exactly
++     * what receivers will see. Payloads over [MAX_UNICAST_TAK_WIRE_PAYLOAD_BYTES] stay broadcast, because firmware
++     * PKI-encrypts unicast (+12 bytes) and rejects the packet as TOO_LARGE rather than falling back.
++     */
++    private fun resolveV2Destination(wirePayload: ByteArray): String {
++        if (wirePayload.size > MAX_UNICAST_TAK_WIRE_PAYLOAD_BYTES) return NodeAddress.ID_BROADCAST
++        val recipients =
++            try {
++                TakRecipients.of(TakV2Compressor.decompressToData(wirePayload))
++            } catch (e: Exception) {
++                Logger.w(e) { "Could not decode outbound TAK packet for routing; broadcasting" }
++                return NodeAddress.ID_BROADCAST
++            }
++        val ownNode = nodeRepository.myNodeInfo.value?.myNodeNum
++        val node = directedRouter.unicastTargetFor(recipients, ownNode) ?: return NodeAddress.ID_BROADCAST
++        return NodeAddress.numToDefaultId(node)
++    }
++
++    /** Remember which UIDs/callsigns belong to the ATAK user(s) on this phone, for receive-side filtering. */
++    private fun learnLocalIdentity(cotMessage: CoTMessage, clientInfo: TAKClientInfo?) {
++        clientInfo?.let { directedRouter.learnLocal(it.uid, it.callsign) }
++        // The local EUD's own position report: event uid is its device uid.
++        if (cotMessage.type.startsWith("a-f-G") && cotMessage.chat == null) {
++            directedRouter.learnLocal(cotMessage.uid, cotMessage.contact?.callsign)
++        }
++    }
++
+     /**
+      * Wrap a [org.meshtastic.proto.TAKPacketV2] into the uncompressed v2 wire format: `[0xFF flag byte][raw protobuf]`.
+      * Used as a fallback when the zstd native lib isn't loaded.
+@@ -384,20 +419,28 @@ class TAKMeshIntegration(
+         val payload = packet.decoded?.payload ?: return
+ 
+         when (packet.decoded?.portnum) {
+-            PortNum.ATAK_PLUGIN_V2 -> handleV2Packet(payload.toByteArray())
++            PortNum.ATAK_PLUGIN_V2 -> handleV2Packet(packet.from, payload.toByteArray())
+             PortNum.ATAK_PLUGIN -> handleV1Packet(payload)
+             else -> return
+         }
+     }
+ 
+-    private fun handleV2Packet(wirePayload: ByteArray) {
++    private fun handleV2Packet(fromNode: Int, wirePayload: ByteArray) {
+         try {
+-            // Decompress to CoT XML via the SDK's CotXmlBuilder, which handles
++            // Decompress to the SDK model first so addressing can be checked, then
++            // build CoT XML via the SDK's CotXmlBuilder, which handles
+             // ALL typed payloads (DrawnShape, Marker, Route, etc.) and preserves
+             // shape detail elements (vertices, colors, stroke weight) that the
+             // app's own CoTXmlParser would strip. Forward the SDK-generated XML
+             // directly to TAK clients without re-parsing.
+-            val rawXml = TakV2Compressor.decompressToXml(wirePayload)
++            val data = TakV2Compressor.decompressToData(wirePayload)
++            directedRouter.learnPeer(fromNode, data)
++            val recipients = TakRecipients.of(data)
++            if (!directedRouter.shouldDeliverLocally(recipients)) {
++                Logger.d { "Dropped directed CoT addressed to someone else: $recipients" }
++                return
++            }
++            val rawXml = TakV2Compressor.dataToXml(data)
+             // Normalize for the TAK TCP stream — drop the <?xml ...?> prologue
+             // and collapse inter-tag whitespace so ATAK's streaming parser sees
+             // bare <event>...</event> on a single line. Centralized in the SDK.
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakDirectedRouting.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakDirectedRouting.kt
+new file mode 100644
+index 0000000..f793a22
+--- /dev/null
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakDirectedRouting.kt
+@@ -0,0 +1,179 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.core.takserver
++
++import kotlinx.atomicfu.atomic
++import kotlinx.atomicfu.update
++import org.meshtastic.tak.CotTypeMapper
++import org.meshtastic.tak.TakPacketV2Data
++import kotlin.time.Clock
++import kotlin.time.Duration
++import kotlin.time.Duration.Companion.minutes
++import kotlin.time.Instant
++
++/**
++ * The addressees of one TAK event, as ATAK expressed them.
++ *
++ * - [uids]: the GeoChat `__chat[@id]` of a direct message (the recipient's ATAK UID). Empty for "All Chat Rooms".
++ * - [callsigns]: the `<marti><dest callsign=…/>` list ATAK attaches to directed traffic (DMs, receipts, TAK-Talk).
++ *
++ * Both empty means the event is for everyone (PLI, All Chat Rooms, markers, …).
++ */
++internal data class TakRecipients(val uids: Set<String>, val callsigns: Set<String>) {
++    val isBroadcast: Boolean
++        get() = uids.isEmpty() && callsigns.isEmpty()
++
++    companion object {
++        private const val ALL_CHAT_ROOMS = "All Chat Rooms"
++
++        fun of(data: TakPacketV2Data): TakRecipients {
++            val chatTo =
++                (data.payload as? TakPacketV2Data.Payload.Chat)?.to?.takeIf { it.isNotEmpty() && it != ALL_CHAT_ROOMS }
++            return TakRecipients(
++                uids = setOfNotNull(chatTo),
++                callsigns = data.marti.filter { it.isNotEmpty() }.toSet(),
++            )
++        }
++    }
++}
++
++/**
++ * Directed routing for TAK traffic over the mesh — the job a real TAK Server does with `<marti>` and that the
++ * phone-local bridge otherwise skips.
++ *
++ * Without it, every GeoChat DM is sent to the mesh broadcast address and every receiving phone hands it to its ATAK,
++ * which files it as a DM — so a message to one person shows up in everyone's DMs.
++ *
++ * Two independent fixes, each enough on its own when it applies:
++ * 1. **Send side** ([unicastTargetFor]): if every addressee maps to one known mesh node, send to that node instead of
++ *    broadcast. Firmware only hands a packet to the phone when it is broadcast or addressed to that node
++ *    (`RoutingModule.cpp`), so other phones never see it — even if they run an unpatched app — and firmware 2.5+
++ *    PKI-encrypts it to the recipient.
++ * 2. **Receive side** ([shouldDeliverLocally]): when a directed event still arrives as a broadcast (unknown recipient,
++ *    group message, oversized, older sender app), drop it unless it is addressed to this phone's ATAK user.
++ *
++ * Both sides fail open: when something is unknown, behaviour is exactly the stock broadcast-to-all.
++ *
++ * Peers (remote ATAK users) are learned from their own TAK traffic arriving off the mesh: the mesh packet's `from` node
++ * plus the PLI uid/callsign or the GeoChat sender uid. Local users are learned from what the local ATAK client sends
++ * us. Entries expire after [peerTtl] so a user who moves to a different radio falls back to broadcast rather than
++ * being unicast to a node they no longer carry.
++ */
++internal class TakDirectedRouter(
++    private val peerTtl: Duration = DEFAULT_PEER_TTL,
++    private val maxPeers: Int = DEFAULT_MAX_PEERS,
++    private val now: () -> Instant = { Clock.System.now() },
++) {
++    private data class PeerEntry(val node: Int, val seenAt: Instant)
++
++    // Copy-on-write maps behind atomic references: written from the mesh collector, read from the TAK-client
++    // collector. Kotlin's default Map is insertion-ordered, which the eviction in [withEntry] relies on.
++    private val peerByUid = atomic(emptyMap<String, PeerEntry>())
++    private val peerByCallsign = atomic(emptyMap<String, PeerEntry>())
++    private val localUids = atomic(emptySet<String>())
++    private val localCallsigns = atomic(emptySet<String>())
++
++    /** Record an identity of an ATAK client connected to this phone's TAK server. */
++    fun learnLocal(uid: String?, callsign: String?) {
++        uid?.takeIf { it.isNotEmpty() && !it.startsWith(GEOCHAT_PREFIX) }?.let { u -> localUids.update { it + u } }
++        callsign?.takeIf { it.isNotEmpty() }?.let { c -> localCallsigns.update { it + c } }
++    }
++
++    /** Record which mesh node a remote ATAK user is behind, from a TAK packet that node originated. */
++    fun learnPeer(fromNode: Int, data: TakPacketV2Data) {
++        if (fromNode == 0 || fromNode == NODENUM_BROADCAST) return
++        val uid: String
++        val callsign: String?
++        when {
++            // GeoChat event uid is GeoChat.<senderUid>.<chatroom>.<messageId>
++            data.uid.startsWith(GEOCHAT_PREFIX) -> {
++                uid = data.uid.split(".", limit = GEOCHAT_UID_PARTS).getOrNull(1) ?: return
++                callsign = (data.payload as? TakPacketV2Data.Payload.Chat)?.toCallsign ?: data.callsign
++            }
++            // Self-reported position (PLI) of a friendly ground EUD: event uid is the device uid.
++            isSelfPli(data) -> {
++                uid = data.uid
++                callsign = data.callsign
++            }
++            else -> return
++        }
++        if (uid.isEmpty()) return
++        val entry = PeerEntry(fromNode, now())
++        peerByUid.update { it.withEntry(uid, entry, maxPeers) }
++        callsign?.takeIf { it.isNotEmpty() }?.let { cs -> peerByCallsign.update { it.withEntry(cs, entry, maxPeers) } }
++    }
++
++    /**
++     * Should an event that arrived from the mesh be handed to this phone's ATAK?
++     *
++     * Only returns false when we are confident it is addressed to someone else.
++     */
++    fun shouldDeliverLocally(recipients: TakRecipients): Boolean {
++        if (recipients.isBroadcast) return true
++        val uids = localUids.value
++        val callsigns = localCallsigns.value
++        // Local ATAK hasn't identified itself yet — can't judge, keep stock behaviour.
++        if (uids.isEmpty() && callsigns.isEmpty()) return true
++        if (recipients.uids.any { it in uids } || recipients.callsigns.any { it in callsigns }) return true
++        // ATAK named the recipients explicitly (<marti>) and we're not among them.
++        if (recipients.callsigns.isNotEmpty()) return false
++        // A DM to an ATAK user we know is someone else.
++        val peers = peerByUid.value
++        if (recipients.uids.any { it in peers }) return false
++        // Unknown room/group id (team chat, custom group): keep stock behaviour.
++        return true
++    }
++
++    /**
++     * The single mesh node every addressee is behind, or null to broadcast. Null when any addressee is unknown or
++     * stale, when they span more than one node, or when the only node is our own.
++     */
++    fun unicastTargetFor(recipients: TakRecipients, ownNode: Int?): Int? {
++        if (recipients.isBroadcast) return null
++        val cutoff = now() - peerTtl
++        val byUid = peerByUid.value
++        val byCallsign = peerByCallsign.value
++        val nodes = mutableSetOf<Int>()
++        for (uid in recipients.uids) nodes += byUid[uid]?.takeIf { it.seenAt >= cutoff }?.node ?: return null
++        for (cs in recipients.callsigns) nodes += byCallsign[cs]?.takeIf { it.seenAt >= cutoff }?.node ?: return null
++        val node = nodes.singleOrNull() ?: return null
++        return node.takeIf { it != ownNode }
++    }
++
++    private fun isSelfPli(data: TakPacketV2Data): Boolean {
++        val payloadIsPli = data.payload is TakPacketV2Data.Payload.Pli || data.payload is TakPacketV2Data.Payload.None
++        val type = data.cotTypeStr ?: CotTypeMapper.typeToString(data.cotTypeId)
++        return payloadIsPli && type != null && type.startsWith(FRIENDLY_GROUND_PREFIX) && data.callsign.isNotEmpty()
++    }
++
++    companion object {
++        val DEFAULT_PEER_TTL: Duration = 30.minutes
++        const val DEFAULT_MAX_PEERS: Int = 256
++        private const val GEOCHAT_PREFIX = "GeoChat."
++        private const val GEOCHAT_UID_PARTS = 4
++        private const val FRIENDLY_GROUND_PREFIX = "a-f-G"
++        private const val NODENUM_BROADCAST = -1 // 0xFFFFFFFF as a signed Int
++
++        private fun <K, V> Map<K, V>.withEntry(key: K, value: V, cap: Int): Map<K, V> {
++            val m = LinkedHashMap(this)
++            m.remove(key) // re-insert so the most recently seen entry is last
++            m[key] = value
++            while (m.size > cap) m.remove(m.keys.first())
++            return m
++        }
++    }
++}
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakV2Compressor.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakV2Compressor.kt
+index 121ecdd..14cef48 100644
+--- a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakV2Compressor.kt
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakV2Compressor.kt
+@@ -87,6 +87,12 @@ internal object TakV2Compressor {
+      */
+     fun decompressToXml(wirePayload: ByteArray): String = CotXmlBuilder().build(sdkCompressor.decompress(wirePayload))
+ 
++    /** Decompress to the SDK model so callers can inspect addressing before (or instead of) building XML. */
++    fun decompressToData(wirePayload: ByteArray): TakPacketV2Data = sdkCompressor.decompress(wirePayload)
++
++    /** Build CoT XML from an already-decompressed packet; same output as [decompressToXml]. */
++    fun dataToXml(data: TakPacketV2Data): String = CotXmlBuilder().build(data)
++
+     /** Convert Wire-generated TAKPacketV2 → SDK's TakPacketV2Data. */
+     private fun wireToSdkData(packet: TAKPacketV2): TakPacketV2Data {
+         val cotTypeId = packet.cot_type_id.value
+diff --git a/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/TakDirectedRouterTest.kt b/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/TakDirectedRouterTest.kt
+new file mode 100644
+index 0000000..a60fd87
+--- /dev/null
++++ b/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/TakDirectedRouterTest.kt
+@@ -0,0 +1,173 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.core.takserver
++
++import org.meshtastic.tak.TakPacketV2Data
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++import kotlin.time.Duration.Companion.minutes
++import kotlin.time.Instant
++
++class TakDirectedRouterTest {
++
++    private var clock = Instant.fromEpochSeconds(1_000_000)
++    private fun router() = TakDirectedRouter(peerTtl = 30.minutes, now = { clock })
++
++    private val nodeA = 0x0a0a0a0a
++    private val nodeB = 0x0b0b0b0b
++    private val nodeMe = 0x0c0c0c0c
++
++    private fun pli(uid: String, callsign: String) =
++        TakPacketV2Data(cotTypeStr = "a-f-G-U-C", uid = uid, callsign = callsign, payload = TakPacketV2Data.Payload.Pli())
++
++    private fun dm(fromUid: String, toUid: String, toCallsign: String?) = TakPacketV2Data(
++        cotTypeStr = "b-t-f",
++        uid = "GeoChat.$fromUid.$toUid.abc123",
++        marti = listOfNotNull(toCallsign),
++        payload = TakPacketV2Data.Payload.Chat(message = "hi", to = toUid),
++    )
++
++    private fun allChat(fromUid: String) = TakPacketV2Data(
++        cotTypeStr = "b-t-f",
++        uid = "GeoChat.$fromUid.All Chat Rooms.m1",
++        payload = TakPacketV2Data.Payload.Chat(message = "hi all", to = null),
++    )
++
++    @Test
++    fun `recipients extracted from DM and broadcast chat`() {
++        val r = TakRecipients.of(dm("ANDROID-me", "ANDROID-a", "ALPHA"))
++        assertEquals(setOf("ANDROID-a"), r.uids)
++        assertEquals(setOf("ALPHA"), r.callsigns)
++        assertTrue(TakRecipients.of(allChat("ANDROID-me")).isBroadcast)
++        assertTrue(TakRecipients.of(pli("ANDROID-a", "ALPHA")).isBroadcast)
++    }
++
++    @Test
++    fun `DM to known peer is unicast to that node`() {
++        val r = router()
++        r.learnPeer(nodeA, pli("ANDROID-a", "ALPHA"))
++        assertEquals(nodeA, r.unicastTargetFor(TakRecipients.of(dm("ANDROID-me", "ANDROID-a", "ALPHA")), nodeMe))
++    }
++
++    @Test
++    fun `DM to unknown peer stays broadcast`() {
++        val r = router()
++        assertNull(r.unicastTargetFor(TakRecipients.of(dm("ANDROID-me", "ANDROID-a", "ALPHA")), nodeMe))
++    }
++
++    @Test
++    fun `stale peer mapping falls back to broadcast`() {
++        val r = router()
++        r.learnPeer(nodeA, pli("ANDROID-a", "ALPHA"))
++        clock += 31.minutes
++        assertNull(r.unicastTargetFor(TakRecipients.of(dm("ANDROID-me", "ANDROID-a", "ALPHA")), nodeMe))
++    }
++
++    @Test
++    fun `recipients on two different nodes stay broadcast`() {
++        val r = router()
++        r.learnPeer(nodeA, pli("ANDROID-a", "ALPHA"))
++        r.learnPeer(nodeB, pli("ANDROID-b", "BRAVO"))
++        val group = TakRecipients(uids = setOf("team-room"), callsigns = setOf("ALPHA", "BRAVO"))
++        assertNull(r.unicastTargetFor(group, nodeMe))
++    }
++
++    @Test
++    fun `peer that moved radios is unicast to the newest node`() {
++        val r = router()
++        r.learnPeer(nodeA, pli("ANDROID-a", "ALPHA"))
++        r.learnPeer(nodeB, pli("ANDROID-a", "ALPHA"))
++        assertEquals(nodeB, r.unicastTargetFor(TakRecipients.of(dm("ANDROID-me", "ANDROID-a", "ALPHA")), nodeMe))
++    }
++
++    @Test
++    fun `never unicast to our own node`() {
++        val r = router()
++        r.learnPeer(nodeMe, pli("ANDROID-a", "ALPHA"))
++        assertNull(r.unicastTargetFor(TakRecipients.of(dm("ANDROID-x", "ANDROID-a", "ALPHA")), nodeMe))
++    }
++
++    @Test
++    fun `peer learned from GeoChat sender uid`() {
++        val r = router()
++        r.learnPeer(nodeA, dm("ANDROID-a", "ANDROID-me", "ME"))
++        assertEquals(nodeA, r.unicastTargetFor(TakRecipients(setOf("ANDROID-a"), emptySet()), nodeMe))
++    }
++
++    @Test
++    fun `DM addressed to me is delivered`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        assertTrue(r.shouldDeliverLocally(TakRecipients.of(dm("ANDROID-a", "ANDROID-me", "ME"))))
++    }
++
++    @Test
++    fun `DM addressed to someone else by marti is dropped`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        assertFalse(r.shouldDeliverLocally(TakRecipients.of(dm("ANDROID-a", "ANDROID-b", "BRAVO"))))
++    }
++
++    @Test
++    fun `DM to known other peer without marti is dropped`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        r.learnPeer(nodeB, pli("ANDROID-b", "BRAVO"))
++        assertFalse(r.shouldDeliverLocally(TakRecipients.of(dm("ANDROID-a", "ANDROID-b", null))))
++    }
++
++    @Test
++    fun `unknown room without marti is delivered (stock behaviour)`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        assertTrue(r.shouldDeliverLocally(TakRecipients(setOf("Cyan"), emptySet())))
++    }
++
++    @Test
++    fun `group message listing me in marti is delivered`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        assertTrue(r.shouldDeliverLocally(TakRecipients(setOf("team-room"), setOf("ALPHA", "ME"))))
++    }
++
++    @Test
++    fun `everything delivered before local ATAK identifies itself`() {
++        val r = router()
++        assertTrue(r.shouldDeliverLocally(TakRecipients.of(dm("ANDROID-a", "ANDROID-b", "BRAVO"))))
++    }
++
++    @Test
++    fun `broadcast traffic always delivered`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        assertTrue(r.shouldDeliverLocally(TakRecipients.of(allChat("ANDROID-a"))))
++        assertTrue(r.shouldDeliverLocally(TakRecipients.of(pli("ANDROID-a", "ALPHA"))))
++    }
++
++    @Test
++    fun `peer table is bounded`() {
++        val r = TakDirectedRouter(maxPeers = 2, now = { clock })
++        r.learnPeer(nodeA, pli("u1", "C1"))
++        r.learnPeer(nodeA, pli("u2", "C2"))
++        r.learnPeer(nodeB, pli("u3", "C3"))
++        assertNull(r.unicastTargetFor(TakRecipients(setOf("u1"), emptySet()), nodeMe), "oldest evicted")
++        assertEquals(nodeB, r.unicastTargetFor(TakRecipients(setOf("u3"), emptySet()), nodeMe))
++    }
++}
+-- 
+2.43.0
+
