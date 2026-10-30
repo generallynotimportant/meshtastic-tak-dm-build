@@ -1,0 +1,111 @@
+# build-apk.yml v0.1
+# Builds the Meshtastic Android app (F-Droid flavor, debug) from the official source
+# with a patch from this repo applied, and attaches the APK to the run.
+# Run it from the Actions tab -> "Build patched Meshtastic APK" -> Run workflow.
+
+name: Build patched Meshtastic APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      meshtastic_ref:
+        description: "Meshtastic-Android tag or branch to build"
+        required: true
+        default: "v2.8.1"
+      patch_file:
+        description: "Patch file to apply (file name in this repo)"
+        required: true
+        default: "meshtastic-tak-directed-dm-v2.8.1-v0.1.patch"
+      run_tests:
+        description: "Run the TAK module unit tests first"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    env:
+      MESHTASTIC_REF: ${{ inputs.meshtastic_ref }}
+      PATCH_FILE: ${{ inputs.patch_file }}
+
+    steps:
+      - name: Check out this repo (patches)
+        uses: actions/checkout@v4
+        with:
+          path: kit
+
+      - name: Clone official Meshtastic-Android at ${{ inputs.meshtastic_ref }}
+        # blob:none keeps the clone small but keeps the commit history, which the
+        # app uses to compute its versionCode (git rev-list --count HEAD).
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --branch "$MESHTASTIC_REF" \
+            https://github.com/meshtastic/Meshtastic-Android.git app \
+            || { echo "::error::Could not clone ref '$MESHTASTIC_REF'. Check the tag/branch name on github.com/meshtastic/Meshtastic-Android."; exit 1; }
+          echo "Source: $(git -C app describe --tags --always)"
+
+      - name: Apply patch
+        working-directory: app
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/$PATCH_FILE"
+          if [ ! -f "$patch" ]; then
+            echo "::error::Patch not found in this repo: $PATCH_FILE"
+            exit 1
+          fi
+          if ! git apply --check "$patch"; then
+            echo "::error::$PATCH_FILE does not apply to $MESHTASTIC_REF. Use the patch made for this version."
+            exit 1
+          fi
+          git apply "$patch"
+          echo "Changed files:"
+          git status --short
+
+      - name: Set up Java 25 (required by the app's build)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Use Meshtastic's CI Gradle settings (fits the runner's memory)
+        working-directory: app
+        run: |
+          mkdir -p ~/.gradle
+          if [ -f .github/ci-gradle.properties ]; then
+            cp .github/ci-gradle.properties ~/.gradle/gradle.properties
+          else
+            echo "::warning::.github/ci-gradle.properties not found in this ref; using the repo defaults."
+          fi
+
+      - name: Set up Gradle (with caching)
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run TAK module tests
+        if: ${{ inputs.run_tests }}
+        working-directory: app
+        run: ./gradlew :core:takserver:allTests -Pci=true -Dorg.gradle.isolated-projects=false
+
+      - name: Build APK (F-Droid flavor, debug)
+        working-directory: app
+        run: ./gradlew androidApp:assembleFdroidDebug -Pci=true -Dorg.gradle.isolated-projects=false
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: meshtastic-tak-dm-${{ inputs.meshtastic_ref }}-fdroid-debug
+          path: app/androidApp/build/outputs/apk/fdroid/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload test reports (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports
+          path: app/core/takserver/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 7
