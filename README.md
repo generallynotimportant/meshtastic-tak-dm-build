@@ -1,50 +1,53 @@
-# Meshtastic TAK DM fix: GitHub build kit (v0.1)
+# Meshtastic TAK DM fix: build kit (v0.3)
 
-**BLUF:** GitHub downloads the official Meshtastic Android source, applies the DM fix, builds the app, and hands you an APK to install on each phone. You don't need to install anything on your computer.
+**BLUF:** This repo builds patched Meshtastic apps, for Android phones (ATAK) and Windows (WinTAK), straight from Meshtastic's official source. With the patch, TAK direct messages go only to the person they're for, and mesh radios show on the map as blue friendly symbols instead of green team dots.
 
-## What's in this repo
+## What the patch changes
+| Version | Change |
+|---|---|
+| v0.2 | A GeoChat DM is sent only to the recipient's radio when it's known, encrypted to that radio by firmware 2.5+. A DM that still arrives as a broadcast is dropped unless it's for this device's TAK user. All Chat is unchanged. |
+| v0.3 | Adds: mesh radio markers ("Mesh to CoT") no longer carry a TAK team, so ATAK/WinTAK draws the MIL-STD-2525 friendly symbol (blue rectangle) instead of a Green team dot. |
+
+## Files
 | File | What it is |
 |---|---|
-| `.github/workflows/build-apk.yml` | The build script. GitHub runs it when you click **Run workflow**. |
-| `meshtastic-tak-directed-dm-v2.8.1-v0.1.patch` | The fix for app version 2.8.1 (the default). |
-| `meshtastic-tak-directed-dm-v0.1.patch` | The same fix for the newest app source (`main`). |
-| `LOCAL-BUILD-NOTES.md` | For later: building on your own computer instead of GitHub. |
+| `.github/workflows/build-apk.yml` | Builds the Android app (APK). |
+| `.github/workflows/build-desktop-windows.yml` | Builds Meshtastic Desktop for Windows (MSI + EXE), used with WinTAK. |
+| `meshtastic-tak-directed-dm-v2.8.1-v0.3.patch` | Current patch for app version 2.8.1 (the default). |
+| `meshtastic-tak-directed-dm-v2.8.1-v0.2.patch` | DM fix only, without the icon change. Known good. |
+| `meshtastic-tak-directed-dm-v0.3.patch` | v0.3 for the newest app source (`main`). |
+| `*-v0.1.patch` | Old; fails Meshtastic's iOS test compile. Kept for history. |
+| `LOCAL-BUILD-NOTES.md` | Building on your own computer instead of GitHub. |
 
-## One-time setup (web browser only)
-1. Sign in at github.com, or create a free account.
-2. Click **+** (top right), then **New repository**.
-   - Name: `meshtastic-tak-dm-build`
-   - Visibility: **Public**. Public repos get the 16 GB build machines this app needs, with unlimited free use. Private repos get 8 GB and draw from a monthly minutes allowance. These files hold no passwords, keys or personal info.
-   - Leave the "Add a README" box **unchecked**, then click **Create repository**.
-3. Add the build script:
-   - Click **creating a new file**, or **Add file → Create new file**.
-   - In the name box, type exactly `.github/workflows/build-apk.yml`. Each `/` creates a folder; GitHub only runs build scripts that live in `.github/workflows`.
-   - Paste the full contents of `build-apk.yml`, then click **Commit changes** twice.
-4. Add the patches:
-   - Click **Add file → Upload files**.
-   - Drag in both `.patch` files and this `README.md`, then click **Commit changes**.
+## Build
+1. Go to **Actions**, click the workflow in the left list (**Build patched Meshtastic APK** or **Build patched Meshtastic Desktop (Windows)**), then **Run workflow**. Keep the defaults and click the green **Run workflow**.
+2. When the run finishes, download the file under **Artifacts** at the bottom of the run page. GitHub keeps it for 14 days; rebuild any time.
 
-## Build the APK (repeat any time)
-1. Open the **Actions** tab. If GitHub asks, click to enable workflows.
-2. In the left list, click **Build patched Meshtastic APK**.
-3. Click **Run workflow** on the right. Leave the defaults (`v2.8.1` and the 2.8.1 patch), then click the green **Run workflow** button.
-4. Refresh the page and click the new run to watch it. Each step turns green as it finishes. The first run takes the longest; later runs reuse downloaded files.
-5. When it finishes, scroll to **Artifacts** at the bottom of the run page and download `meshtastic-tak-dm-v2.8.1-fdroid-debug`. It's a zip with the `.apk` inside.
+## Install: Android phones (ATAK)
+1. The APK zip holds three files. Install the one with **`universal`** in its name. Play Protect will scan it; if it warns, choose **More details → Install anyway**.
+2. It installs alongside the official Meshtastic app. Disconnect the official app from the radio and turn off its TAK server. Then connect the radio in the patched app and turn on its TAK server.
+3. In the patched app, export the TAK data package and import it into ATAK. Each install makes its own certificates, so an old package won't connect.
+4. Each new build is signed with a different debug key, so uninstall the old patched app before installing a newer one.
 
-## Install and set up on each phone
-1. Copy the `.apk` to the phone (USB cable, Google Drive, and so on) and tap it to install. Android will ask you to allow installs from that app (Files, Drive, etc.); allow it.
-2. It installs **next to** the official Meshtastic app, with a separate app ID (`com.geeksville.mesh.fdroid.debug`). Disconnect the official app from the radio and turn off its TAK server. Then connect the radio in the patched app and turn on its TAK server. Both apps use port 8089, so only one can run the TAK server at a time.
-3. In the patched app, **export a new TAK data package** and import it into ATAK. Each app install creates its own certificates, so your old zip won't connect.
+## Install: Windows PC (WinTAK)
+1. Install the `.msi` from the Windows build zip. It's unsigned, so if Windows warns: **More info → Run anyway**. It replaces any official Meshtastic Desktop install.
+2. Plug in the PC's radio by USB, connect to it in Meshtastic Desktop, and turn on the TAK server.
+3. Export the TAK data package and unzip it. WinTAK doesn't import this package directly, so set it up by hand:
+   - In WinTAK, add a new server connection.
+   - **Address:** `127.0.0.1`, **Port:** `8089`, **SSL/TLS**
+   - Import `truststore.p12` (CA) and `client.p12` (client certificate), both with password `meshtastic`.
+   - The connection indicator turns green when it's connected.
 
-## Test
-Use three phones, all patched, all showing each other on the ATAK map. A DMs B: B should get it and C shouldn't.
+## Test (three stations, each with its own radio)
+1. Wait until every station shows on every other station's map. That's how each app learns which radio everyone is on.
+2. A DMs B: B gets it, C doesn't. C (WinTAK) DMs A: A gets it, B doesn't. All Chat still reaches everyone.
+3. Mesh radios (with **Mesh to CoT** on) should show as blue friendly symbols, and TAK users as their team-colored dots.
+
+## Don't press
+**TAK Mesh Test (Debug)** in the app's TAK settings transmits 41 sample TAK messages over the mesh for real, including fake markers and emergency alerts. It only appears because these are debug builds.
 
 ## If a build fails
-On the run page, click the step with the red ✗, copy the last ~50 lines of its log, and send them to me. If the failure was in **Run TAK module tests**, also download the `test-reports` artifact.
+Click the step with the red ✗ and copy the last ~50 lines of its log, or use **⋯ → Download log archive**. If the failure was in **Run TAK module tests**, also download the `test-reports` artifact.
 
 ## Building a different version later
-On **Run workflow**, change:
-- **Meshtastic-Android tag or branch**: for example `v2.8.2`, or `main`.
-- **Patch file**: the patch made for that version.
-
-If the patch doesn't fit that version, the run stops at **Apply patch** and says so. Send me the version and I'll port the fix.
+On **Run workflow**, change **Meshtastic-Android tag or branch** (for example `v2.8.2`) and **Patch file**. If the patch doesn't fit, the run stops at **Apply patch** and says so; the patch then needs porting to that version.
