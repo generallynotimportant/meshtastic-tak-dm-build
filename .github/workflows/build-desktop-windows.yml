@@ -1,4 +1,4 @@
-# build-desktop-windows.yml v0.1
+# build-desktop-windows.yml v0.2
 # Builds Meshtastic Desktop for Windows (MSI + EXE installers) from the official source
 # with a patch from this repo applied. The desktop app runs the same TAK server as the
 # phone app (127.0.0.1:8089), so WinTAK on the same PC connects to it the way ATAK does.
@@ -16,7 +16,7 @@ on:
       patch_file:
         description: "Patch file to apply (file name in this repo)"
         required: true
-        default: "meshtastic-tak-directed-dm-v2.8.1-v0.3.patch"
+        default: "meshtastic-tak-directed-dm-v2.8.1-v0.4.patch"
 
 permissions:
   contents: read
@@ -113,7 +113,9 @@ jobs:
 
       - name: Build Windows installers (MSI + EXE)
         working-directory: app
-        run: ./gradlew :desktopApp:packageDistributionForCurrentOS -Pci=true -Dorg.gradle.isolated-projects=false
+        run: |
+          set -o pipefail
+          ./gradlew :desktopApp:packageDistributionForCurrentOS -Pci=true -Dorg.gradle.isolated-projects=false 2>&1 | tee gradle-build.log
 
       - name: Upload installers
         uses: actions/upload-artifact@v7
@@ -124,3 +126,20 @@ jobs:
             app/desktopApp/build/compose/binaries/main/*/*.exe
           if-no-files-found: error
           retention-days: 14
+
+      - name: Report build errors (on failure)
+        # Posts compiler/test errors as a run annotation so they're readable from the run summary
+        # (and the GitHub API) without downloading the full log.
+        if: failure()
+        run: |
+          set +e
+          cat app/gradle-*.log 2>/dev/null \
+            | grep -E '^e: |^w: .*(TakDirected|MeshBreadcrumbs|MeshToCot|TakPrefs)|FAILED|What went wrong|^> [^T]|Exception|expected' \
+            | sed -e 's#file:///[^ ]*/app/##' -e 's#/home/runner/work/[^ ]*/app/##' -e 's#[A-Za-z]:/a/[^ ]*/app/##' \
+            | head -60 > errors.txt
+          if [ -s errors.txt ]; then
+            msg="$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' errors.txt | awk '{printf "%s%%0A", $0}')"
+            echo "::error title=Build errors::${msg}"
+          else
+            echo "::error title=Build errors::No compiler or test errors captured; see the failed step's log."
+          fi

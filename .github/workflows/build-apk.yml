@@ -1,4 +1,4 @@
-# build-apk.yml v0.2
+# build-apk.yml v0.3
 # Builds the Meshtastic Android app (F-Droid flavor, debug) from the official source
 # with a patch from this repo applied, and attaches the APK to the run.
 # Run it from the Actions tab -> "Build patched Meshtastic APK" -> Run workflow.
@@ -15,7 +15,7 @@ on:
       patch_file:
         description: "Patch file to apply (file name in this repo)"
         required: true
-        default: "meshtastic-tak-directed-dm-v2.8.1-v0.3.patch"
+        default: "meshtastic-tak-directed-dm-v2.8.1-v0.4.patch"
       run_tests:
         description: "Run the TAK module unit tests first"
         type: boolean
@@ -103,11 +103,15 @@ jobs:
       - name: Run TAK module tests
         if: ${{ inputs.run_tests }}
         working-directory: app
-        run: ./gradlew :core:takserver:allTests -Pci=true -Dorg.gradle.isolated-projects=false
+        run: |
+          set -o pipefail
+          ./gradlew :core:takserver:allTests -Pci=true -Dorg.gradle.isolated-projects=false 2>&1 | tee gradle-tests.log
 
       - name: Build APK (F-Droid flavor, debug)
         working-directory: app
-        run: ./gradlew androidApp:assembleFdroidDebug -Pci=true -Dorg.gradle.isolated-projects=false
+        run: |
+          set -o pipefail
+          ./gradlew androidApp:assembleFdroidDebug -Pci=true -Dorg.gradle.isolated-projects=false 2>&1 | tee gradle-build.log
 
       - name: Upload APK
         uses: actions/upload-artifact@v7
@@ -125,3 +129,20 @@ jobs:
           path: app/core/takserver/build/reports/tests/
           if-no-files-found: ignore
           retention-days: 7
+
+      - name: Report build errors (on failure)
+        # Posts compiler/test errors as a run annotation so they're readable from the run summary
+        # (and the GitHub API) without downloading the full log.
+        if: failure()
+        run: |
+          set +e
+          cat app/gradle-*.log 2>/dev/null \
+            | grep -E '^e: |^w: .*(TakDirected|MeshBreadcrumbs|MeshToCot|TakPrefs)|FAILED|What went wrong|^> [^T]|Exception|expected' \
+            | sed -e 's#file:///[^ ]*/app/##' -e 's#/home/runner/work/[^ ]*/app/##' -e 's#[A-Za-z]:/a/[^ ]*/app/##' \
+            | head -60 > errors.txt
+          if [ -s errors.txt ]; then
+            msg="$(sed -e 's/%/%25/g' -e 's/\r/%0D/g' errors.txt | awk '{printf "%s%%0A", $0}')"
+            echo "::error title=Build errors::${msg}"
+          else
+            echo "::error title=Build errors::No compiler or test errors captured; see the failed step's log."
+          fi

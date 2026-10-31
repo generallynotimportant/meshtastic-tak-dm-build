@@ -1,11 +1,12 @@
-# Meshtastic TAK DM fix: build kit (v0.3)
+# Meshtastic TAK DM fix: build kit (v0.4)
 
-**BLUF:** This repo builds patched Meshtastic apps, for Android phones (ATAK) and Windows (WinTAK), straight from Meshtastic's official source. With the patch, TAK direct messages go only to the person they're for, and mesh radios show on the map as blue friendly symbols instead of green team dots.
+**BLUF:** This repo builds patched Meshtastic apps, for Android phones (ATAK) and Windows (WinTAK), straight from Meshtastic's official source. With the patch, TAK direct messages go only to the person they're for, and mesh radios show on the map as blue friendly symbols instead of green team dots. You can also pick which radios appear on the map, and give any radio a breadcrumb trail of dots (e.g. a dog's tracker).
 
 ## What the patch changes
 | Version | Change |
 |---|---|
 | v0.2 | A GeoChat DM is sent only to the recipient's radio when it's known, encrypted to that radio by firmware 2.5+. A DM that still arrives as a broadcast is dropped unless it's for this device's TAK user. All Chat is unchanged. |
+| v0.4 | Adds a **Mesh to CoT radios** card (TAK Server settings, shown when Mesh to CoT is on): **Only show selected radios**, a **Choose radios** list with **Show** / **Trail** checkboxes, and trail settings (dot interval, keep time, colour). Hidden radios are removed from the map. Trail dots are recorded even while ATAK is disconnected and replayed when it reconnects; they never go over the radio. |
 | v0.3 | Adds: mesh radio markers ("Mesh to CoT") no longer carry a TAK team, so ATAK/WinTAK draws the MIL-STD-2525 friendly symbol (blue rectangle) instead of a Green team dot. |
 
 ## Files
@@ -13,8 +14,9 @@
 |---|---|
 | `.github/workflows/build-apk.yml` | Builds the Android app (APK). |
 | `.github/workflows/build-desktop-windows.yml` | Builds Meshtastic Desktop for Windows (MSI + EXE), used with WinTAK. |
-| `meshtastic-tak-directed-dm-v2.8.1-v0.3.patch` | Current patch for app version 2.8.1 (the default). |
-| `meshtastic-tak-directed-dm-v2.8.1-v0.2.patch` | DM fix only, without the icon change. Known good. |
+| `meshtastic-tak-directed-dm-v2.8.1-v0.4.patch` | Current patch for app version 2.8.1 (the default). |
+| `meshtastic-tak-directed-dm-v2.8.1-v0.3.patch` | DM fix + blue radio icons, without the radio picker or trails. Known good. |
+| `meshtastic-tak-directed-dm-v2.8.1-v0.2.patch` | DM fix only. Known good. |
 | `meshtastic-tak-directed-dm-v0.3.patch` | v0.3 for the newest app source (`main`). |
 | `*-v0.1.patch` | Old; fails Meshtastic's iOS test compile. Kept for history. |
 | `LOCAL-BUILD-NOTES.md` | Building on your own computer instead of GitHub. |
@@ -42,6 +44,12 @@
 1. Wait until every station shows on every other station's map. That's how each app learns which radio everyone is on.
 2. A DMs B: B gets it, C doesn't. C (WinTAK) DMs A: A gets it, B doesn't. All Chat still reaches everyone.
 3. Mesh radios (with **Mesh to CoT** on) should show as blue friendly symbols, and TAK users as their team-colored dots.
+
+## Breadcrumb trail (e.g. tracking a dog)
+1. On the tracker radio, set its position broadcast interval to about the trail interval you want (Meshtastic app → the radio's **Position** settings). The trail can't be finer than how often the radio reports.
+2. In the patched app: **TAK Server → Mesh to CoT** on → **Mesh to CoT radios → Choose radios**, then tick **Trail** for the tracker.
+3. Dots appear only when the radio has moved and the interval has passed, labelled with its short name and the time. They expire after the keep time. Unticking **Trail** removes them.
+4. Trail dots only exist for positions your device actually heard. Out of range means gaps.
 
 ## Don't press
 **TAK Mesh Test (Debug)** in the app's TAK settings transmits 41 sample TAK messages over the mesh for real, including fake markers and emergency alerts. It only appears because these are debug builds.
