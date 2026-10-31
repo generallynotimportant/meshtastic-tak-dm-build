@@ -1,0 +1,126 @@
+# build-desktop-windows.yml v0.1
+# Builds Meshtastic Desktop for Windows (MSI + EXE installers) from the official source
+# with a patch from this repo applied. The desktop app runs the same TAK server as the
+# phone app (127.0.0.1:8089), so WinTAK on the same PC connects to it the way ATAK does.
+# Run it from the Actions tab -> "Build patched Meshtastic Desktop (Windows)" -> Run workflow.
+
+name: Build patched Meshtastic Desktop (Windows)
+
+on:
+  workflow_dispatch:
+    inputs:
+      meshtastic_ref:
+        description: "Meshtastic-Android tag or branch to build"
+        required: true
+        default: "v2.8.1"
+      patch_file:
+        description: "Patch file to apply (file name in this repo)"
+        required: true
+        default: "meshtastic-tak-directed-dm-v2.8.1-v0.2.patch"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: bash
+    env:
+      MESHTASTIC_REF_RAW: ${{ inputs.meshtastic_ref }}
+      PATCH_FILE_RAW: ${{ inputs.patch_file }}
+
+    steps:
+      - name: Clean up inputs
+        # Strips spaces/newlines a pasted value can carry; names here never contain spaces.
+        run: |
+          set -euo pipefail
+          ref="$(printf '%s' "$MESHTASTIC_REF_RAW" | tr -d '[:space:]')"
+          patch="$(printf '%s' "$PATCH_FILE_RAW" | tr -d '[:space:]')"
+          if [ "$patch" != "$PATCH_FILE_RAW" ] || [ "$ref" != "$MESHTASTIC_REF_RAW" ]; then
+            echo "::notice::Removed stray spaces from the inputs."
+          fi
+          echo "MESHTASTIC_REF=$ref" >> "$GITHUB_ENV"
+          echo "PATCH_FILE=$patch" >> "$GITHUB_ENV"
+          echo "Version: $ref"
+          echo "Patch:   $patch"
+
+      - name: Check out this repo (patches)
+        uses: actions/checkout@v7.0.1
+        with:
+          path: kit
+
+      - name: Clone official Meshtastic-Android (includes Desktop) at ${{ inputs.meshtastic_ref }}
+        # blob:none keeps the clone small but keeps the commit history, which the
+        # build uses to compute its version code (git rev-list --count HEAD).
+        run: |
+          set -euo pipefail
+          git config --global core.longpaths true
+          git clone --filter=blob:none --branch "$MESHTASTIC_REF" \
+            https://github.com/meshtastic/Meshtastic-Android.git app \
+            || { echo "::error::Could not clone ref '$MESHTASTIC_REF'. Check the tag/branch name on github.com/meshtastic/Meshtastic-Android."; exit 1; }
+          echo "Source: $(git -C app describe --tags --always)"
+
+      - name: Apply patch
+        working-directory: app
+        run: |
+          set -euo pipefail
+          patch="$GITHUB_WORKSPACE/kit/$PATCH_FILE"
+          if [ ! -f "$patch" ]; then
+            echo "::error::Patch not found in this repo: $(printf '%q' "$PATCH_FILE")"
+            echo "Patch files that ARE in this repo (top level):"
+            ls -1 "$GITHUB_WORKSPACE/kit" | grep -i '\.patch' | while IFS= read -r f; do printf '  %q\n' "$f"; done || echo "  (none)"
+            exit 1
+          fi
+          if ! git apply --check "$patch"; then
+            echo "::error::$PATCH_FILE does not apply to $MESHTASTIC_REF. Use the patch made for this version."
+            exit 1
+          fi
+          git apply "$patch"
+          echo "Changed files:"
+          git status --short
+
+      # Same two JDKs Meshtastic's own desktop CI installs: Temurin 25 for the build,
+      # JetBrains Runtime 25 for Compose Desktop packaging. If the JBR download fails,
+      # Gradle provisions it itself (Foojay), as in upstream CI.
+      - name: Set up Java 25 (Temurin)
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up JetBrains Runtime 25 (for Compose Desktop)
+        continue-on-error: true
+        uses: actions/setup-java@v5
+        with:
+          distribution: jetbrains
+          java-version: "25"
+
+      - name: Use Meshtastic's CI Gradle settings (fits the runner's memory)
+        working-directory: app
+        run: |
+          mkdir -p ~/.gradle
+          if [ -f .github/ci-gradle.properties ]; then
+            cp .github/ci-gradle.properties ~/.gradle/gradle.properties
+          else
+            echo "::warning::.github/ci-gradle.properties not found in this ref; using the repo defaults."
+          fi
+
+      - name: Set up Gradle (with caching)
+        uses: gradle/actions/setup-gradle@v6
+
+      - name: Build Windows installers (MSI + EXE)
+        working-directory: app
+        run: ./gradlew :desktopApp:packageDistributionForCurrentOS -Pci=true -Dorg.gradle.isolated-projects=false
+
+      - name: Upload installers
+        uses: actions/upload-artifact@v7
+        with:
+          name: meshtastic-desktop-tak-dm-${{ env.MESHTASTIC_REF }}-windows
+          path: |
+            app/desktopApp/build/compose/binaries/main/*/*.msi
+            app/desktopApp/build/compose/binaries/main/*/*.exe
+          if-no-files-found: error
+          retention-days: 14
