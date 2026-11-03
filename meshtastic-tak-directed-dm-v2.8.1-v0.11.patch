@@ -2187,7 +2187,7 @@ index 0000000..435fcab
 +    }
 +
 +    @Test
-+    fun `package has MANIFEST folder and files in one sub-folder, no nested zip`() {
++    fun `package has MANIFEST folder and files in one sub-folder with no nested zip`() {
 +        val entries = TAKDataPackageGenerator.winTakEntries()
 +        assertTrue("MANIFEST/manifest.xml" in entries, "${entries.keys}")
 +        val files = entries.keys - "MANIFEST/manifest.xml"
