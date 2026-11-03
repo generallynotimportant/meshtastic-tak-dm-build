@@ -1,0 +1,2515 @@
+From a1fc0f9ebeb8db2ecb7c6109f852fd86507e84c3 Mon Sep 17 00:00:00 2001
+From: TAK DM fix <tak-dm-fix@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 19:13:09 -0400
+Subject: [PATCH] TAK: DM routing, radio map controls, trails, stale cleanup
+ (v0.8)
+
+- v0.2: DMs go only to the recipient's node when known.
+- v0.3: radio markers carry no TAK team (2525 friendly symbol).
+- v0.4: radio picker and breadcrumb trails.
+- v0.5: "Show on map" mode (radios + clients / clients only / clients +
+  radios without a client).
+- v0.6: remove radios not heard within a set time.
+- v0.7: remove quiet TAK users (own setting); delete leftover radio markers
+  (own radio, hidden, earlier runs) on enable/connect; trail minimum
+  distance; keep trail dots forever (<archive/>); radio details gain
+  "Last heard" and "Hops", trail dots carry SNR/hops; plain-language
+  TAK server start error (port in use).
+- v0.8: shortest trail interval is 1 minute (radios never report faster);
+  saved 30-second settings act as 1 minute.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_01YNdppB9cmN2Z3ecoU69yUA
+---
+ .../meshtastic/core/prefs/tak/TakPrefsImpl.kt | 108 +++++
+ .../core/repository/AppPreferences.kt         |  75 +++
+ .../core/takserver/MeshBreadcrumbs.kt         | 228 +++++++++
+ .../core/takserver/MeshNodeCoTConversion.kt   |  28 +-
+ .../core/takserver/MeshToCotBroadcaster.kt    | 204 +++++++-
+ .../meshtastic/core/takserver/TAKDefaults.kt  |   8 +
+ .../core/takserver/TAKMeshIntegration.kt      |  86 +++-
+ .../core/takserver/TAKServerManager.kt        |  29 ++
+ .../core/takserver/TakDirectedRouting.kt      | 195 ++++++++
+ .../core/takserver/TakUserExpiry.kt           |  49 ++
+ .../core/takserver/TakV2Compressor.kt         |   6 +
+ .../core/takserver/MeshBreadcrumbsTest.kt     | 435 ++++++++++++++++++
+ .../takserver/MeshNodeCoTConversionTest.kt    |   3 +-
+ .../core/takserver/TakDirectedRouterTest.kt   | 183 ++++++++
+ .../core/testing/FakeAppPreferences.kt        |  67 +++
+ .../radio/component/MeshToCotRadiosCard.kt    | 317 +++++++++++++
+ .../radio/component/TAKConfigItemList.kt      |  19 +-
+ 17 files changed, 2025 insertions(+), 15 deletions(-)
+ create mode 100644 core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshBreadcrumbs.kt
+ create mode 100644 core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakDirectedRouting.kt
+ create mode 100644 core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakUserExpiry.kt
+ create mode 100644 core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/MeshBreadcrumbsTest.kt
+ create mode 100644 core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/TakDirectedRouterTest.kt
+ create mode 100644 feature/settings/src/commonMain/kotlin/org/meshtastic/feature/settings/radio/component/MeshToCotRadiosCard.kt
+
+diff --git a/core/prefs/src/commonMain/kotlin/org/meshtastic/core/prefs/tak/TakPrefsImpl.kt b/core/prefs/src/commonMain/kotlin/org/meshtastic/core/prefs/tak/TakPrefsImpl.kt
+index a80cb21..bb325cf 100644
+--- a/core/prefs/src/commonMain/kotlin/org/meshtastic/core/prefs/tak/TakPrefsImpl.kt
++++ b/core/prefs/src/commonMain/kotlin/org/meshtastic/core/prefs/tak/TakPrefsImpl.kt
+@@ -19,6 +19,8 @@ package org.meshtastic.core.prefs.tak
+ import androidx.datastore.preferences.core.booleanPreferencesKey
+ import androidx.datastore.preferences.core.edit
+ import androidx.datastore.preferences.core.intPreferencesKey
++import androidx.datastore.preferences.core.stringPreferencesKey
++import androidx.datastore.preferences.core.stringSetPreferencesKey
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.SupervisorJob
+ import kotlinx.coroutines.flow.SharingStarted
+@@ -29,6 +31,7 @@ import kotlinx.coroutines.launch
+ import org.koin.core.annotation.Single
+ import org.meshtastic.core.di.CoroutineDispatchers
+ import org.meshtastic.core.prefs.di.UiDataStore
++import org.meshtastic.core.repository.MeshToCotRadioMode
+ import org.meshtastic.core.repository.TakPrefs
+ 
+ @Single(binds = [TakPrefs::class])
+@@ -56,7 +59,112 @@ class TakPrefsImpl(private val dataStore: UiDataStore, dispatchers: CoroutineDis
+         scope.launch { dataStore.edit { prefs -> prefs[KEY_TAK_SERVER_CHANNEL] = index } }
+     }
+ 
++    override val meshToCotRadioMode: StateFlow<MeshToCotRadioMode> =
++        dataStore.data
++            .map { prefs ->
++                MeshToCotRadioMode.entries.firstOrNull { it.name == prefs[KEY_MESH_TO_COT_RADIO_MODE] }
++                    ?: MeshToCotRadioMode.RADIOS_AND_CLIENTS
++            }
++            .stateIn(scope, SharingStarted.Eagerly, MeshToCotRadioMode.RADIOS_AND_CLIENTS)
++
++    override fun setMeshToCotRadioMode(mode: MeshToCotRadioMode) {
++        scope.launch { dataStore.edit { prefs -> prefs[KEY_MESH_TO_COT_RADIO_MODE] = mode.name } }
++    }
++
++    override val meshToCotMaxAgeMinutes: StateFlow<Int> =
++        dataStore.data
++            .map { it[KEY_MESH_TO_COT_MAX_AGE_MINUTES] ?: TakPrefs.DEFAULT_MESH_TO_COT_MAX_AGE_MINUTES }
++            .stateIn(scope, SharingStarted.Eagerly, TakPrefs.DEFAULT_MESH_TO_COT_MAX_AGE_MINUTES)
++
++    override fun setMeshToCotMaxAgeMinutes(minutes: Int) {
++        scope.launch { dataStore.edit { prefs -> prefs[KEY_MESH_TO_COT_MAX_AGE_MINUTES] = minutes } }
++    }
++
++    override val meshToCotOnlySelected: StateFlow<Boolean> =
++        dataStore.data.map { it[KEY_MESH_TO_COT_ONLY_SELECTED] ?: false }.stateIn(scope, SharingStarted.Eagerly, false)
++
++    override fun setMeshToCotOnlySelected(onlySelected: Boolean) {
++        scope.launch { dataStore.edit { prefs -> prefs[KEY_MESH_TO_COT_ONLY_SELECTED] = onlySelected } }
++    }
++
++    override val meshToCotShownNodes: StateFlow<Set<Int>> =
++        dataStore.data
++            .map { it[KEY_MESH_TO_COT_SHOWN_NODES].toNodeNums() }
++            .stateIn(scope, SharingStarted.Eagerly, emptySet())
++
++    override fun setMeshToCotShownNodes(nodes: Set<Int>) {
++        scope.launch { dataStore.edit { prefs -> prefs[KEY_MESH_TO_COT_SHOWN_NODES] = nodes.toPrefStrings() } }
++    }
++
++    override val breadcrumbNodes: StateFlow<Set<Int>> =
++        dataStore.data.map { it[KEY_BREADCRUMB_NODES].toNodeNums() }.stateIn(scope, SharingStarted.Eagerly, emptySet())
++
++    override fun setBreadcrumbNodes(nodes: Set<Int>) {
++        scope.launch { dataStore.edit { prefs -> prefs[KEY_BREADCRUMB_NODES] = nodes.toPrefStrings() } }
++    }
++
++    override val takUserMaxAgeMinutes: StateFlow<Int> =
++        dataStore.data
++            .map { it[KEY_TAK_USER_MAX_AGE_MINUTES] ?: TakPrefs.DEFAULT_TAK_USER_MAX_AGE_MINUTES }
++            .stateIn(scope, SharingStarted.Eagerly, TakPrefs.DEFAULT_TAK_USER_MAX_AGE_MINUTES)
++
++    override fun setTakUserMaxAgeMinutes(minutes: Int) {
++        scope.launch { dataStore.edit { prefs -> prefs[KEY_TAK_USER_MAX_AGE_MINUTES] = minutes } }
++    }
++
++    override val breadcrumbMinDistanceMeters: StateFlow<Int> =
++        dataStore.data
++            .map { it[KEY_BREADCRUMB_MIN_DISTANCE_METERS] ?: TakPrefs.DEFAULT_BREADCRUMB_MIN_DISTANCE_METERS }
++            .stateIn(scope, SharingStarted.Eagerly, TakPrefs.DEFAULT_BREADCRUMB_MIN_DISTANCE_METERS)
++
++    override fun setBreadcrumbMinDistanceMeters(meters: Int) {
++        scope.launch { dataStore.edit { prefs -> prefs[KEY_BREADCRUMB_MIN_DISTANCE_METERS] = meters } }
++    }
++
++    override val breadcrumbIntervalSeconds: StateFlow<Int> =
++        dataStore.data
++            .map { it[KEY_BREADCRUMB_INTERVAL_SECONDS] ?: TakPrefs.DEFAULT_BREADCRUMB_INTERVAL_SECONDS }
++            .stateIn(scope, SharingStarted.Eagerly, TakPrefs.DEFAULT_BREADCRUMB_INTERVAL_SECONDS)
++
++    override fun setBreadcrumbIntervalSeconds(seconds: Int) {
++        scope.launch { dataStore.edit { prefs -> prefs[KEY_BREADCRUMB_INTERVAL_SECONDS] = seconds } }
++    }
++
++    override val breadcrumbKeepMinutes: StateFlow<Int> =
++        dataStore.data
++            .map { it[KEY_BREADCRUMB_KEEP_MINUTES] ?: TakPrefs.DEFAULT_BREADCRUMB_KEEP_MINUTES }
++            .stateIn(scope, SharingStarted.Eagerly, TakPrefs.DEFAULT_BREADCRUMB_KEEP_MINUTES)
++
++    override fun setBreadcrumbKeepMinutes(minutes: Int) {
++        scope.launch { dataStore.edit { prefs -> prefs[KEY_BREADCRUMB_KEEP_MINUTES] = minutes } }
++    }
++
++    override val breadcrumbColorArgb: StateFlow<Int> =
++        dataStore.data
++            .map { it[KEY_BREADCRUMB_COLOR_ARGB] ?: TakPrefs.DEFAULT_BREADCRUMB_COLOR_ARGB }
++            .stateIn(scope, SharingStarted.Eagerly, TakPrefs.DEFAULT_BREADCRUMB_COLOR_ARGB)
++
++    override fun setBreadcrumbColorArgb(argb: Int) {
++        scope.launch { dataStore.edit { prefs -> prefs[KEY_BREADCRUMB_COLOR_ARGB] = argb } }
++    }
++
+     companion object {
++        val KEY_MESH_TO_COT_RADIO_MODE = stringPreferencesKey("tak_mesh_to_cot_radio_mode")
++        val KEY_MESH_TO_COT_MAX_AGE_MINUTES = intPreferencesKey("tak_mesh_to_cot_max_age_minutes")
++        val KEY_MESH_TO_COT_ONLY_SELECTED = booleanPreferencesKey("tak_mesh_to_cot_only_selected")
++        val KEY_MESH_TO_COT_SHOWN_NODES = stringSetPreferencesKey("tak_mesh_to_cot_shown_nodes")
++        val KEY_BREADCRUMB_NODES = stringSetPreferencesKey("tak_breadcrumb_nodes")
++        val KEY_TAK_USER_MAX_AGE_MINUTES = intPreferencesKey("tak_user_max_age_minutes")
++        val KEY_BREADCRUMB_MIN_DISTANCE_METERS = intPreferencesKey("tak_breadcrumb_min_distance_meters")
++        val KEY_BREADCRUMB_INTERVAL_SECONDS = intPreferencesKey("tak_breadcrumb_interval_seconds")
++        val KEY_BREADCRUMB_KEEP_MINUTES = intPreferencesKey("tak_breadcrumb_keep_minutes")
++        val KEY_BREADCRUMB_COLOR_ARGB = intPreferencesKey("tak_breadcrumb_color_argb")
++
++        // Node numbers are stored as decimal strings; unparseable entries are skipped rather than crashing.
++        private fun Set<String>?.toNodeNums(): Set<Int> = this?.mapNotNull { it.toIntOrNull() }?.toSet() ?: emptySet()
++
++        private fun Set<Int>.toPrefStrings(): Set<String> = mapTo(mutableSetOf()) { it.toString() }
++
+         val KEY_TAK_SERVER_ENABLED = booleanPreferencesKey("tak_server_enabled")
+         val KEY_TAK_MESH_TO_COT = booleanPreferencesKey("tak_mesh_to_cot")
+         val KEY_TAK_SERVER_CHANNEL = intPreferencesKey("tak_server_channel")
+diff --git a/core/repository/src/commonMain/kotlin/org/meshtastic/core/repository/AppPreferences.kt b/core/repository/src/commonMain/kotlin/org/meshtastic/core/repository/AppPreferences.kt
+index a91be5a..ffb0a52 100644
+--- a/core/repository/src/commonMain/kotlin/org/meshtastic/core/repository/AppPreferences.kt
++++ b/core/repository/src/commonMain/kotlin/org/meshtastic/core/repository/AppPreferences.kt
+@@ -364,6 +364,18 @@ interface MeshPrefs {
+     fun setStoreForwardLastRequest(address: String?, timestamp: Int)
+ }
+ 
++/** Which mesh radios Mesh-to-CoT puts on the TAK map, relative to radios that carry a TAK client (ATAK/WinTAK user). */
++enum class MeshToCotRadioMode {
++    /** Every radio marker, plus TAK clients (stock behaviour). */
++    RADIOS_AND_CLIENTS,
++
++    /** Only TAK clients; no radio markers (breadcrumb-trail radios still show). */
++    CLIENTS_ONLY,
++
++    /** TAK clients plus radios that have no TAK client on them (e.g. a standalone tracker). */
++    CLIENTS_AND_RADIOS_WITHOUT_CLIENT,
++}
++
+ /** Reactive interface for TAK server settings. */
+ interface TakPrefs {
+     val isTakServerEnabled: StateFlow<Boolean>
+@@ -385,6 +397,69 @@ interface TakPrefs {
+     val takServerChannel: StateFlow<Int>
+ 
+     fun setTakServerChannel(index: Int)
++
++    /** Which radios Mesh-to-CoT shows relative to TAK clients. Applied before the [meshToCotOnlySelected] picker. */
++    val meshToCotRadioMode: StateFlow<MeshToCotRadioMode>
++
++    fun setMeshToCotRadioMode(mode: MeshToCotRadioMode)
++
++    /** Radios not heard for this many minutes are removed from the TAK map (stock Meshtastic keeps them 2 hours). */
++    val meshToCotMaxAgeMinutes: StateFlow<Int>
++
++    fun setMeshToCotMaxAgeMinutes(minutes: Int)
++
++    /** When true, Mesh-to-CoT publishes only radios in [meshToCotShownNodes] or [breadcrumbNodes]; false = all. */
++    val meshToCotOnlySelected: StateFlow<Boolean>
++
++    fun setMeshToCotOnlySelected(onlySelected: Boolean)
++
++    /** Node numbers the user picked to show on the TAK map when [meshToCotOnlySelected] is on. */
++    val meshToCotShownNodes: StateFlow<Set<Int>>
++
++    fun setMeshToCotShownNodes(nodes: Set<Int>)
++
++    /** Node numbers that leave a breadcrumb trail of spot-map dots (always shown on the map). */
++    val breadcrumbNodes: StateFlow<Set<Int>>
++
++    fun setBreadcrumbNodes(nodes: Set<Int>)
++
++    /**
++     * TAK users (ATAK/WinTAK positions heard over the mesh) not heard for this many minutes are removed from the local
++     * TAK map. 0 = never (stock: ATAK greys them out and keeps them).
++     */
++    val takUserMaxAgeMinutes: StateFlow<Int>
++
++    fun setTakUserMaxAgeMinutes(minutes: Int)
++
++    /** Minimum metres a radio must move from its last breadcrumb before a new one drops. */
++    val breadcrumbMinDistanceMeters: StateFlow<Int>
++
++    fun setBreadcrumbMinDistanceMeters(meters: Int)
++
++    /** Minimum seconds between breadcrumbs for one radio. */
++    val breadcrumbIntervalSeconds: StateFlow<Int>
++
++    fun setBreadcrumbIntervalSeconds(seconds: Int)
++
++    /** How long each breadcrumb stays on the map before it expires. 0 = forever (saved in the TAK client). */
++    val breadcrumbKeepMinutes: StateFlow<Int>
++
++    fun setBreadcrumbKeepMinutes(minutes: Int)
++
++    /** ATAK colour (signed ARGB int, e.g. -65536 = red) for breadcrumb dots. */
++    val breadcrumbColorArgb: StateFlow<Int>
++
++    fun setBreadcrumbColorArgb(argb: Int)
++
++    companion object {
++        const val DEFAULT_MESH_TO_COT_MAX_AGE_MINUTES = 30
++        const val DEFAULT_TAK_USER_MAX_AGE_MINUTES = 30
++        const val DEFAULT_BREADCRUMB_MIN_DISTANCE_METERS = 10
++        const val BREADCRUMB_KEEP_FOREVER = 0
++        const val DEFAULT_BREADCRUMB_INTERVAL_SECONDS = 60
++        const val DEFAULT_BREADCRUMB_KEEP_MINUTES = 360
++        const val DEFAULT_BREADCRUMB_COLOR_ARGB = -65536 // red
++    }
+ }
+ 
+ /** Reactive interface for App Functions (system AI integration) preferences. */
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshBreadcrumbs.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshBreadcrumbs.kt
+new file mode 100644
+index 0000000..02b1cfb
+--- /dev/null
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshBreadcrumbs.kt
+@@ -0,0 +1,228 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.core.takserver
++
++import kotlinx.datetime.TimeZone
++import kotlinx.datetime.toLocalDateTime
++import org.meshtastic.core.repository.MeshToCotRadioMode
++import kotlin.math.PI
++import kotlin.math.asin
++import kotlin.math.cos
++import kotlin.math.sin
++import kotlin.math.sqrt
++import kotlin.random.Random
++import kotlin.time.Duration
++import kotlin.time.Duration.Companion.seconds
++import kotlin.time.Instant
++
++/** The stable CoT UID for mesh node [num], e.g. `MESHTASTIC-A1B2C3D4`. See [org.meshtastic.core.model.Node.cotUid]. */
++internal fun meshNodeCotUid(num: Int): String =
++    MESH_NODE_UID_PREFIX + num.toUInt().toString(TAK_HEX_RADIX).uppercase().padStart(MESH_NODE_UID_HEX_WIDTH, '0')
++
++/**
++ * Which radios Mesh-to-CoT puts on the TAK map.
++ *
++ * [mode] decides first (all radios / none / only radios without a TAK client, using [clientNodes] — radios a TAK
++ * client's traffic was recently heard from), then the [onlySelected] picker narrows it further. A radio with a
++ * breadcrumb trail is always shown — a trail of a radio you can't see is not useful.
++ */
++internal data class MeshToCotSelection(
++    val onlySelected: Boolean = false,
++    val shownNodes: Set<Int> = emptySet(),
++    val trailNodes: Set<Int> = emptySet(),
++    val mode: MeshToCotRadioMode = MeshToCotRadioMode.RADIOS_AND_CLIENTS,
++    val clientNodes: Set<Int> = emptySet(),
++) {
++    fun isShown(num: Int): Boolean {
++        if (num in trailNodes) return true
++        val modeAllows =
++            when (mode) {
++                MeshToCotRadioMode.RADIOS_AND_CLIENTS -> true
++                MeshToCotRadioMode.CLIENTS_ONLY -> false
++                MeshToCotRadioMode.CLIENTS_AND_RADIOS_WITHOUT_CLIENT -> num !in clientNodes
++            }
++        return modeAllows && (!onlySelected || num in shownNodes)
++    }
++
++    fun hasTrail(num: Int): Boolean = num in trailNodes
++}
++
++/**
++ * Breadcrumb trail settings. [keepForever] marks dots as saved (`<archive/>`, like a spot marker the user placed) so
++ * the TAK client keeps them; [keepFor] is then just a far-off stale time.
++ */
++internal data class BreadcrumbSettings(
++    val interval: Duration,
++    val keepFor: Duration,
++    val colorArgb: Int,
++    val minDistanceMeters: Int = 0,
++    val keepForever: Boolean = false,
++)
++
++/** One dropped breadcrumb: a spot-map dot at a radio's position at a point in time. */
++internal data class Breadcrumb(
++    val nodeNum: Int,
++    val uid: String,
++    val latitudeI: Int,
++    val longitudeI: Int,
++    val droppedAt: Instant,
++    val xml: String,
++)
++
++/**
++ * Remembers the breadcrumbs dropped for each radio so they can be replayed to a newly connected TAK client, removed
++ * from the map when a trail is turned off, and forgotten once they expire.
++ *
++ * A breadcrumb is dropped only when the radio has moved since its last one AND at least [BreadcrumbSettings.interval]
++ * has passed, so a parked radio doesn't stack dots on one spot. Not thread-safe; callers serialize access.
++ */
++internal class BreadcrumbTrail(private val now: () -> Instant) {
++    private val crumbs = mutableMapOf<Int, ArrayDeque<Breadcrumb>>()
++
++    /**
++     * Drops a breadcrumb for [nodeNum] at the given position when due, returning it (null when not due). The trail is
++     * capped so a short interval with a long keep time can't grow without bound.
++     */
++    @Suppress("LongParameterList")
++    fun maybeDrop(
++        nodeNum: Int,
++        callsign: String,
++        latitudeI: Int,
++        longitudeI: Int,
++        settings: BreadcrumbSettings,
++        signal: String? = null,
++    ): Breadcrumb? {
++        val at = now()
++        val trail = crumbs.getOrPut(nodeNum) { ArrayDeque() }
++        val last = trail.lastOrNull()
++        if (last != null) {
++            val moved = last.latitudeI != latitudeI || last.longitudeI != longitudeI
++            if (!moved || at - last.droppedAt < settings.interval) return null
++            // Filters GPS jitter: a radio lying still wanders a few metres between fixes.
++            if (distanceMeters(last.latitudeI, last.longitudeI, latitudeI, longitudeI) < settings.minDistanceMeters) {
++                return null
++            }
++        }
++        val uid = "${meshNodeCotUid(nodeNum)}-trail-${at.epochSeconds}-${Random.nextInt(0, RANDOM_SUFFIX_BOUND)}"
++        val crumb =
++            Breadcrumb(
++                nodeNum = nodeNum,
++                uid = uid,
++                latitudeI = latitudeI,
++                longitudeI = longitudeI,
++                droppedAt = at,
++                xml = breadcrumbCotXml(uid, nodeNum, callsign, latitudeI, longitudeI, at, settings, signal),
++            )
++        trail.addLast(crumb)
++        while (trail.size > MAX_CRUMBS_PER_NODE) trail.removeFirst()
++        return crumb
++    }
++
++    /** Forgets breadcrumbs older than [keepFor]; ATAK has already dropped them via their stale time. */
++    fun expire(keepFor: Duration) {
++        val cutoff = now() - keepFor
++        crumbs.values.forEach { trail -> while (trail.firstOrNull()?.let { it.droppedAt < cutoff } == true) trail.removeFirst() }
++        crumbs.entries.removeAll { it.value.isEmpty() }
++    }
++
++    /** Removes and returns every breadcrumb of [nodeNum] (to delete them from the TAK map). */
++    fun removeNode(nodeNum: Int): List<Breadcrumb> = crumbs.remove(nodeNum)?.toList() ?: emptyList()
++
++    /** Node numbers that currently have breadcrumbs. */
++    fun nodes(): Set<Int> = crumbs.filterValues { it.isNotEmpty() }.keys.toSet()
++
++    /** Every live breadcrumb, oldest first per radio (for replay to a new TAK client). */
++    fun all(): List<Breadcrumb> = crumbs.values.flatMap { it.toList() }
++
++    companion object {
++        /** Hard cap per radio: one day at a 30-second interval. */
++        const val MAX_CRUMBS_PER_NODE = 2_880
++        private const val RANDOM_SUFFIX_BOUND = 1_000_000
++    }
++}
++
++/**
++ * A spot-map dot (CoT `b-m-p-s-m`, same shape ATAK itself emits — see the SDK's `marker_spot.xml` fixture) labelled
++ * with the radio's short name and the local time it was there. It expires on its own after the keep time, unless
++ * [BreadcrumbSettings.keepForever] marks it saved. [signal] (SNR / hops when the dot dropped) goes in the details.
++ */
++@Suppress("LongParameterList")
++internal fun breadcrumbCotXml(
++    uid: String,
++    nodeNum: Int,
++    callsign: String,
++    latitudeI: Int,
++    longitudeI: Int,
++    at: Instant,
++    settings: BreadcrumbSettings,
++    signal: String? = null,
++): String {
++    val lat = latitudeI.toDouble() / TAK_COORDINATE_SCALE
++    val lon = longitudeI.toDouble() / TAK_COORDINATE_SCALE
++    val hhmm = localHhMm(at)
++    val remarks = listOfNotNull("Breadcrumb: $callsign at $hhmm", signal?.takeIf { it.isNotEmpty() }).joinToString(" | ")
++    val archive = if (settings.keepForever) "<archive/>" else ""
++    val label = "${callsign.substringBefore(" - ").trim().ifEmpty { callsign }} $hhmm"
++    val time = at.toCotTime()
++    val stale = (at + settings.keepFor).toCotTime()
++    val color = settings.colorArgb
++    return "<event version='2.0' uid='${uid.xmlEscaped()}' type='b-m-p-s-m' time='$time' start='$time' " +
++        "stale='$stale' how='h-g-i-g-o'><point lat='$lat' lon='$lon' hae='9999999.0' ce='9999999.0' " +
++        "le='9999999.0'/><detail><status readiness='true'/>$archive" +
++        "<link uid='${meshNodeCotUid(nodeNum).xmlEscaped()}' type='$DEFAULT_PLI_COT_TYPE' relation='p-p'/>" +
++        "<contact callsign='${label.xmlEscaped()}'/>" +
++        "<remarks>${remarks.xmlEscaped()}</remarks>" +
++        "<color argb='$color'/><usericon iconsetpath='COT_MAPPING_SPOTMAP/b-m-p-s-m/$color'/></detail></event>"
++}
++
++/**
++ * A CoT delete (`t-x-d-d`) telling TAK clients to remove the map item [targetUid] — same shape as the SDK's
++ * `delete_event.xml` fixture, captured from a real TAK server.
++ */
++internal fun deleteCotXml(targetUid: String, targetType: String, at: Instant): String {
++    val time = at.toCotTime()
++    val stale = (at + DELETE_EVENT_STALE).toCotTime()
++    val uid = "delete-${targetUid}-${at.toEpochMilliseconds()}"
++    return "<event version='2.0' uid='${uid.xmlEscaped()}' type='t-x-d-d' how='h-g-i-g-o' time='$time' " +
++        "start='$time' stale='$stale'><point lat='0' lon='0' hae='0' ce='9999999' le='9999999'/><detail>" +
++        "<link relation='p-p' uid='${targetUid.xmlEscaped()}' type='${targetType.xmlEscaped()}'/></detail></event>"
++}
++
++private val DELETE_EVENT_STALE: Duration = 20.seconds
++
++/** Local wall-clock `HH:MM` for labels and details. */
++internal fun localHhMm(at: Instant): String {
++    val local = at.toLocalDateTime(TimeZone.currentSystemDefault())
++    return "${local.hour.toString().padStart(2, '0')}:${local.minute.toString().padStart(2, '0')}"
++}
++
++private const val EARTH_RADIUS_METERS = 6_371_000.0
++
++/** Great-circle distance in metres between two points given as degrees × 1e7. */
++internal fun distanceMeters(lat1I: Int, lon1I: Int, lat2I: Int, lon2I: Int): Double {
++    fun rad(i: Int) = i.toDouble() / TAK_COORDINATE_SCALE * PI / 180.0
++    val dLat = rad(lat2I) - rad(lat1I)
++    val dLon = rad(lon2I) - rad(lon1I)
++    val a = sin(dLat / 2) * sin(dLat / 2) + cos(rad(lat1I)) * cos(rad(lat2I)) * sin(dLon / 2) * sin(dLon / 2)
++    return 2 * EARTH_RADIUS_METERS * asin(sqrt(a))
++}
++
++/** CoT timestamp: UTC, millisecond precision, always with the fraction (same rule as CoTXml's formatter). */
++private fun Instant.toCotTime(): String {
++    val base = Instant.fromEpochMilliseconds(toEpochMilliseconds()).toString()
++    return if (base.contains('.')) base else base.removeSuffix("Z") + ".000Z"
++}
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshNodeCoTConversion.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshNodeCoTConversion.kt
+index 5f420b0..9b40541 100644
+--- a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshNodeCoTConversion.kt
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshNodeCoTConversion.kt
+@@ -45,8 +45,7 @@ internal fun Node.isEligibleForCot(ourNodeNum: Int?, lastHeardThreshold: Int = o
+  * Upper-case hex is load-bearing, not cosmetic — see [MESH_NODE_UID_PREFIX]. Deliberately not built from
+  * [NodeAddress.numToDefaultId], which formats `!%08x` in lower case for display.
+  */
+-internal fun Node.cotUid(): String =
+-    MESH_NODE_UID_PREFIX + num.toUInt().toString(TAK_HEX_RADIX).uppercase().padStart(MESH_NODE_UID_HEX_WIDTH, '0')
++internal fun Node.cotUid(): String = meshNodeCotUid(num)
+ 
+ /**
+  * The ATAK callsign for [this] node — `"SHORT - Long Name"`, matching Apple. Falls back through the names that are
+@@ -87,6 +86,25 @@ internal fun Node.cotRemarks(): String? {
+     return parts.joinToString(" | ").ifEmpty { null }
+ }
+ 
++/**
++ * When this radio was last heard (local time) and how many hops away it is, e.g. `Last heard: 05:12 | Hops: 0`. Tells an
++ * operator how old the marker's position is, and whether the SNR in [cotRemarks] is from the radio itself (0 hops) or
++ * from the last relay.
++ */
++internal fun Node.cotLinkRemarks(): String {
++    val parts = buildList {
++        if (lastHeard > 0) add("Last heard: ${localHhMm(kotlin.time.Instant.fromEpochSeconds(lastHeard.toLong()))}")
++        if (hopsAway >= 0) add("Hops: $hopsAway")
++    }
++    return parts.joinToString(" | ")
++}
++
++/** SNR / hops at this moment, for a breadcrumb's details. */
++internal fun Node.cotSignalRemarks(): String = buildList {
++    snrOrNull?.let { add("SNR: ${NumberFormatter.format(it, 1)} dB") }
++    if (hopsAway >= 0) add("Hops: $hopsAway")
++}.joinToString(" | ")
++
+ /** Apple prints voltage with two decimals (`%.2f`) where every other telemetry field uses one. */
+ private const val VOLTAGE_DECIMALS = 2
+ 
+@@ -104,5 +122,9 @@ internal fun Node.toCoTMessage(): CoTMessage = user.toCoTMessage(
+     uid = cotUid(),
+     callsign = cotCallsign(),
+     staleMinutes = MESH_NODE_STALE_MINUTES,
+-    remarks = cotRemarks(),
++    remarks = listOfNotNull(cotLinkRemarks().ifEmpty { null }, cotRemarks()).joinToString(" | ").ifEmpty { null },
+ )
++    // No <__group>: ATAK draws a team-coloured dot for anything carrying a team, which made mesh radios look like
++    // Green-team TAK users. Without it ATAK should draw the MIL-STD-2525 symbol for the CoT type (a-f-G-U-C ->
++    // friendly blue rectangle), so radios read as equipment on the map, distinct from people.
++    .copy(group = null)
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshToCotBroadcaster.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshToCotBroadcaster.kt
+index c78c9ec..3ca1d6f 100644
+--- a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshToCotBroadcaster.kt
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/MeshToCotBroadcaster.kt
+@@ -21,7 +21,11 @@ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Job
+ import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.delay
++import kotlinx.coroutines.flow.MutableStateFlow
+ import kotlinx.coroutines.flow.collectLatest
++import kotlinx.coroutines.flow.combine
++import kotlinx.coroutines.flow.distinctUntilChanged
++import kotlinx.coroutines.flow.drop
+ import kotlinx.coroutines.launch
+ import kotlinx.coroutines.sync.Mutex
+ import kotlinx.coroutines.sync.withLock
+@@ -32,6 +36,10 @@ import org.meshtastic.core.repository.TakPrefs
+ import kotlin.concurrent.Volatile
+ import kotlin.concurrent.atomics.AtomicBoolean
+ import kotlin.concurrent.atomics.ExperimentalAtomicApi
++import kotlin.time.Clock
++import kotlin.time.Duration.Companion.days
++import kotlin.time.Duration.Companion.minutes
++import kotlin.time.Duration.Companion.seconds
+ import kotlin.time.Instant
+ 
+ /**
+@@ -49,6 +57,7 @@ class MeshToCotBroadcaster(
+     private val nodeRepository: NodeRepository,
+     private val takPrefs: TakPrefs,
+     private val dispatchers: CoroutineDispatchers,
++    private val now: () -> Instant = { Clock.System.now() },
+ ) {
+     private val isRunning = AtomicBoolean(false)
+ 
+@@ -57,8 +66,26 @@ class MeshToCotBroadcaster(
+     // Last CoT sent per node number, time-normalized (see normalizeForDedup) so an unchanged node
+     // is not re-sent on every unrelated nodeDB emission. Guarded by sentMutex.
+     private val lastSent = mutableMapOf<Int, CoTMessage>()
++
++    // Radios whose marker is currently on the TAK map. Unlike lastSent this survives the periodic refresh, so hiding
++    // a radio always finds its marker to delete. Guarded by sentMutex.
++    private val onMap = mutableSetOf<Int>()
+     private val sentMutex = Mutex()
+ 
++    // Breadcrumb dots dropped per radio. Recorded even with no TAK client attached (the trail keeps growing while ATAK
++    // is closed) and replayed on connect. Guarded by trailMutex.
++    private val trail = BreadcrumbTrail(now)
++
++    // Mesh nodes known to carry a TAK client, pushed by TAKMeshIntegration as it hears TAK traffic. Used by
++    // MeshToCotRadioMode.CLIENTS_AND_RADIOS_WITHOUT_CLIENT to hide radios whose user already shows as a TAK client.
++    private val clientNodes = MutableStateFlow<Set<Int>>(emptySet())
++
++    /** Updates which mesh nodes carry a TAK client; markers are re-filtered when this changes. */
++    fun setTakClientNodes(nodes: Set<Int>) {
++        clientNodes.value = nodes
++    }
++    private val trailMutex = Mutex()
++
+     fun start(scope: CoroutineScope) {
+         // CAS, not a job-null check: two concurrent start() calls must not both launch, and a
+         // dead job left by a cancelled scope must not block every future start().
+@@ -93,6 +120,7 @@ class MeshToCotBroadcaster(
+         // Fresh dedup state per enable cycle, so nothing carried over from a previous run (or a
+         // previous device) suppresses the initial publish.
+         clearSent()
++        cleanUpLeftovers(reason = "enabled")
+ 
+         // A newly attached client has none of our prior broadcasts, so drop the dedup state
+         // and replay every eligible node. Uses the live snapshot rather than the nodeDBbyNum
+@@ -100,7 +128,9 @@ class MeshToCotBroadcaster(
+         launch {
+             takServerManager.clientConnected.collect {
+                 clearSent()
++                cleanUpLeftovers(reason = "client connected")
+                 publish(nodeRepository.getNodeDbSnapshot().values, reason = "client connected")
++                replayBreadcrumbs()
+             }
+         }
+ 
+@@ -115,6 +145,141 @@ class MeshToCotBroadcaster(
+         }
+ 
+         launch { nodeRepository.nodeDBbyNum.collect { publish(it.values, reason = "node update") } }
++
++        // Age-out check: drops radios not heard within the max age even when nothing else changes. Dedup keeps this
++        // from re-sending unchanged markers.
++        launch {
++            while (true) {
++                delay(MESH_TO_COT_AGE_CHECK_INTERVAL_MS)
++                publish(nodeRepository.getNodeDbSnapshot().values, reason = "age check")
++            }
++        }
++
++        // Radio picker / trail changes: remove what is no longer wanted from the map, then republish.
++        launch {
++            selectionFlow().distinctUntilChanged().drop(1).collect { selection ->
++                applySelectionChange(selection)
++                clearSent()
++                publish(nodeRepository.getNodeDbSnapshot().values, reason = "radio selection changed")
++            }
++        }
++    }
++
++    private fun selectionFlow() =
++        combine(
++            takPrefs.meshToCotOnlySelected,
++            takPrefs.meshToCotShownNodes,
++            takPrefs.breadcrumbNodes,
++            takPrefs.meshToCotRadioMode,
++            clientNodes,
++        ) { onlySelected, shown, trailNodes, mode, clients ->
++            MeshToCotSelection(onlySelected, shown, trailNodes, mode, clients)
++        }
++
++    private fun currentSelection() =
++        MeshToCotSelection(
++            onlySelected = takPrefs.meshToCotOnlySelected.value,
++            shownNodes = takPrefs.meshToCotShownNodes.value,
++            trailNodes = takPrefs.breadcrumbNodes.value,
++            mode = takPrefs.meshToCotRadioMode.value,
++            clientNodes = clientNodes.value,
++        )
++
++    private fun currentTrailSettings(): BreadcrumbSettings {
++        val keepMinutes = takPrefs.breadcrumbKeepMinutes.value
++        val forever = keepMinutes == TakPrefs.BREADCRUMB_KEEP_FOREVER
++        return BreadcrumbSettings(
++            interval = takPrefs.breadcrumbIntervalSeconds.value.coerceAtLeast(MIN_TRAIL_INTERVAL_SECONDS).seconds,
++            keepFor = if (forever) FOREVER_STALE_DAYS.days else keepMinutes.coerceAtLeast(1).minutes,
++            colorArgb = takPrefs.breadcrumbColorArgb.value,
++            minDistanceMeters = takPrefs.breadcrumbMinDistanceMeters.value.coerceAtLeast(0),
++            keepForever = forever,
++        )
++    }
++
++    private fun lastHeardThreshold(): Int {
++        val maxAgeMinutes = takPrefs.meshToCotMaxAgeMinutes.value.coerceAtLeast(1)
++        return (now() - maxAgeMinutes.minutes).epochSeconds.toInt()
++    }
++
++    /**
++     * Sends a delete for every radio in the node DB that should NOT be on the map right now (hidden, aged out, or our
++     * own radio). Clears markers left in the TAK client by an earlier run or older build, which this session never
++     * placed and so would otherwise never remove. Deletes for markers that don't exist are ignored by TAK clients.
++     */
++    private suspend fun cleanUpLeftovers(reason: String) {
++        if (takServerManager.connectionCount.value <= 0) return
++        val ourNodeNum = nodeRepository.myNodeInfo.value?.myNodeNum
++        val selection = currentSelection()
++        val threshold = lastHeardThreshold()
++        val stale =
++            nodeRepository.getNodeDbSnapshot().values.filterNot {
++                it.isEligibleForCot(ourNodeNum, threshold) && selection.isShown(it.num)
++            }
++        val at = now()
++        for (node in stale) {
++            if (takServerManager.connectionCount.value <= 0) return
++            takServerManager.broadcastRawXml(deleteCotXml(node.cotUid(), DEFAULT_PLI_COT_TYPE, at))
++            delay(MESH_TO_COT_BROADCAST_SPACING_MS)
++        }
++        sentMutex.withLock {
++            val goneNums = stale.mapTo(mutableSetOf()) { it.num }
++            onMap.removeAll(goneNums)
++            goneNums.forEach { lastSent.remove(it) }
++        }
++        if (stale.isNotEmpty()) Logger.i { "Mesh-to-CoT: cleared ${stale.size} leftover radio marker(s) ($reason)" }
++    }
++
++    /**
++     * Deletes the markers of radios that are no longer shown and the breadcrumbs of radios whose trail was turned off.
++     * Deletes are sent only with a client attached; a client that connects later never gets them in the first place.
++     */
++    private suspend fun applySelectionChange(selection: MeshToCotSelection) {
++        val at = now()
++        val hidden =
++            sentMutex.withLock {
++                onMap.filterNot { selection.isShown(it) }.also { gone ->
++                    onMap.removeAll(gone.toSet())
++                    gone.forEach { lastSent.remove(it) }
++                }
++            }
++        val droppedCrumbs =
++            trailMutex.withLock { trail.nodes().filterNot { selection.hasTrail(it) }.flatMap { trail.removeNode(it) } }
++        if (takServerManager.connectionCount.value <= 0) return
++        hidden.forEach { takServerManager.broadcastRawXml(deleteCotXml(meshNodeCotUid(it), DEFAULT_PLI_COT_TYPE, at)) }
++        droppedCrumbs.forEach { takServerManager.broadcastRawXml(deleteCotXml(it.uid, BREADCRUMB_COT_TYPE, at)) }
++        if (hidden.isNotEmpty() || droppedCrumbs.isNotEmpty()) {
++            Logger.i { "Mesh-to-CoT: removed ${hidden.size} hidden radio(s), ${droppedCrumbs.size} breadcrumb(s)" }
++        }
++    }
++
++    /** Records due breadcrumbs for trail radios; returns the new ones to send. Runs whether or not a client is attached. */
++    private suspend fun recordBreadcrumbs(nodes: List<Node>, selection: MeshToCotSelection): List<Breadcrumb> {
++        if (selection.trailNodes.isEmpty()) return emptyList()
++        val settings = currentTrailSettings()
++        return trailMutex.withLock {
++            trail.expire(settings.keepFor)
++            nodes.filter { selection.hasTrail(it.num) }.mapNotNull { node ->
++                val pos = node.validPosition ?: return@mapNotNull null
++                trail.maybeDrop(
++                    node.num,
++                    node.cotCallsign(),
++                    pos.latitude_i ?: 0,
++                    pos.longitude_i ?: 0,
++                    settings,
++                    signal = node.cotSignalRemarks(),
++                )
++            }
++        }
++    }
++
++    private suspend fun replayBreadcrumbs() {
++        val crumbs = trailMutex.withLock { trail.expire(currentTrailSettings().keepFor); trail.all() }
++        for (crumb in crumbs) {
++            if (takServerManager.connectionCount.value <= 0) return
++            takServerManager.broadcastRawXml(crumb.xml)
++            delay(MESH_TO_COT_BROADCAST_SPACING_MS)
++        }
+     }
+ 
+     private suspend fun publish(nodes: Collection<Node>, reason: String) {
+@@ -123,8 +288,17 @@ class MeshToCotBroadcaster(
+         // client triggers a full replay. Re-checked per node because a client can disconnect
+         // mid-replay, and the inter-message spacing makes a large replay take whole seconds.
+         val ourNodeNum = nodeRepository.myNodeInfo.value?.myNodeNum
+-        val eligible = nodes.filter { it.isEligibleForCot(ourNodeNum) }
++        val selection = currentSelection()
++        val threshold = lastHeardThreshold()
++        val eligible = nodes.filter { it.isEligibleForCot(ourNodeNum, threshold) && selection.isShown(it.num) }
++        removeNoLongerEligible(eligible.mapTo(mutableSetOf()) { it.num })
++        val newCrumbs = recordBreadcrumbs(eligible, selection)
+         var sent = 0
++        for (crumb in newCrumbs) {
++            if (takServerManager.connectionCount.value <= 0) break
++            takServerManager.broadcastRawXml(crumb.xml)
++            delay(MESH_TO_COT_BROADCAST_SPACING_MS)
++        }
+         for (node in eligible) {
+             if (takServerManager.connectionCount.value <= 0) return
+             val cot = node.toCoTMessage()
+@@ -138,17 +312,45 @@ class MeshToCotBroadcaster(
+         }
+     }
+ 
++    /**
++     * Deletes the markers of radios that are on the map but no longer eligible: not heard within the max age, gone from
++     * the node list, hidden, or our own radio (published before our node number was known). Needs a client to delete
++     * from; the radio stays tracked as on-map until then.
++     */
++    private suspend fun removeNoLongerEligible(eligibleNums: Set<Int>) {
++        if (takServerManager.connectionCount.value <= 0) return
++        val gone =
++            sentMutex.withLock {
++                onMap.filter { it !in eligibleNums }.also { g ->
++                    onMap.removeAll(g.toSet())
++                    g.forEach { lastSent.remove(it) }
++                }
++            }
++        if (gone.isEmpty()) return
++        val at = now()
++        gone.forEach { takServerManager.broadcastRawXml(deleteCotXml(meshNodeCotUid(it), DEFAULT_PLI_COT_TYPE, at)) }
++        Logger.i { "Mesh-to-CoT: removed ${gone.size} radio marker(s) no longer eligible" }
++    }
++
+     /** Records [cot] as the latest for [nodeNum], returning false when an identical event was already sent. */
+     private suspend fun admit(nodeNum: Int, cot: CoTMessage): Boolean = sentMutex.withLock {
+         val normalized = normalizeForDedup(cot)
+         if (lastSent[nodeNum] == normalized) return false
+         lastSent[nodeNum] = normalized
++        onMap.add(nodeNum)
+         true
+     }
+ 
+     private suspend fun clearSent() = sentMutex.withLock { lastSent.clear() }
+ 
+     private companion object {
++        const val BREADCRUMB_COT_TYPE = "b-m-p-s-m"
++        // Field-tested: radios never reported faster than once a minute (Meshtastic's minimum position broadcast),
++        // so a shorter trail interval only promised dots that never came.
++        const val MIN_TRAIL_INTERVAL_SECONDS = 60
++        const val MESH_TO_COT_AGE_CHECK_INTERVAL_MS = 60_000L
++        const val FOREVER_STALE_DAYS = 3650
++
+         /**
+          * Strips the timestamps so two events describing the same node state compare equal. Every other CoT field
+          * participates, so any change to position, callsign, battery, or telemetry re-broadcasts.
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKDefaults.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKDefaults.kt
+index 1a823c5..d01b57c 100644
+--- a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKDefaults.kt
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKDefaults.kt
+@@ -69,6 +69,14 @@ internal const val TAK_DIRECT_MESSAGE_PARTS_MIN = 3
+  */
+ internal const val MAX_TAK_WIRE_PAYLOAD_BYTES = 225
+ 
++/**
++ * Largest v2 payload sent unicast to a single node. Firmware PKI-encrypts unicast packets when it has the recipient's
++ * key, adding MESHTASTIC_PKC_OVERHEAD (12 bytes) and returning TOO_LARGE instead of falling back to channel
++ * encryption. ~228 − 12 ≈ 216 bytes are available; 210 keeps a margin. Larger directed packets stay broadcast and rely
++ * on the receive-side filter in [TakDirectedRouter].
++ */
++internal const val MAX_UNICAST_TAK_WIRE_PAYLOAD_BYTES = 210
++
+ /** Default CoT type for PLI (Position Location Information) — friendly ground unit. */
+ internal const val DEFAULT_PLI_COT_TYPE = "a-f-G-U-C"
+ 
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKMeshIntegration.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKMeshIntegration.kt
+index d536a63..8690fb6 100644
+--- a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKMeshIntegration.kt
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKMeshIntegration.kt
+@@ -21,10 +21,13 @@ package org.meshtastic.core.takserver
+ import co.touchlab.kermit.Logger
+ import kotlinx.coroutines.CoroutineScope
+ import kotlinx.coroutines.Job
++import kotlinx.coroutines.delay
+ import kotlinx.coroutines.flow.distinctUntilChanged
+ import kotlinx.coroutines.flow.filter
+ import kotlinx.coroutines.flow.map
+ import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.withLock
+ import okio.ByteString.Companion.toByteString
+ import org.meshtastic.core.model.Capabilities
+ import org.meshtastic.core.model.DataPacket
+@@ -42,6 +45,7 @@ import org.meshtastic.proto.MeshPacket
+ import org.meshtastic.proto.PortNum
+ import org.meshtastic.proto.TAKPacket
+ import org.meshtastic.proto.Team
++import org.meshtastic.tak.CotTypeMapper
+ import kotlin.concurrent.Volatile
+ import kotlin.concurrent.atomics.AtomicBoolean
+ import kotlin.concurrent.atomics.ExperimentalAtomicApi
+@@ -115,6 +119,14 @@ class TAKMeshIntegration(
+     // from the single meshPacketFlow collector coroutine (handleMeshPacket), so no locking.
+     private val deliveryDedup = CotDeliveryDedup()
+ 
++    // Directed routing for DMs / receipts / TAK-Talk: unicast to the recipient's node when known,
++    // and drop directed traffic addressed to someone else on receive. See TakDirectedRouter.
++    private val directedRouter = TakDirectedRouter()
++
++    // Last time each remote TAK user's PLI was heard over the mesh, so quiet users can be removed from the local map.
++    private val userExpiry = TakUserExpiry(now = { Clock.System.now() })
++    private val userExpiryMutex = Mutex()
++
+     fun start(scope: CoroutineScope) {
+         if (!isRunning.compareAndSet(expectedValue = false, newValue = true)) return
+ 
+@@ -122,6 +134,13 @@ class TAKMeshIntegration(
+ 
+         val newJobs =
+             listOf(
++                // Remove TAK users not heard within the configured time (0 = keep them, stock behaviour).
++                scope.launch {
++                    while (true) {
++                        delay(TAK_USER_EXPIRY_CHECK_MS)
++                        expireQuietTakUsers()
++                    }
++                },
+                 // Forward incoming CoT from TAK clients to mesh
+                 scope.launch {
+                     takServerManager.inboundMessages.collect { (cotMessage, clientInfo) ->
+@@ -144,6 +163,7 @@ class TAKMeshIntegration(
+                             } else {
+                                 cotMessage
+                             }
++                        learnLocalIdentity(cotMessage, clientInfo)
+                         sendCoTToMesh(enriched)
+                     }
+                 },
+@@ -296,15 +316,16 @@ class TAKMeshIntegration(
+             }
+ 
+         return try {
++            val destination = resolveV2Destination(wirePayload)
+             val dataPacket =
+                 DataPacket(
+-                    to = NodeAddress.ID_BROADCAST,
++                    to = destination,
+                     bytes = wirePayload.toByteString(),
+                     dataType = PortNum.ATAK_PLUGIN_V2.value,
+                     channel = takPrefs.takServerChannel.value,
+                 )
+             commandSender.sendData(dataPacket)
+-            Logger.d { "Sent V2 to mesh: ${cotMessage.type} (${wirePayload.size} bytes)" }
++            Logger.d { "Sent V2 to mesh: ${cotMessage.type} (${wirePayload.size} bytes) to=$destination" }
+             TakSendOutcome.Sent(wirePayload.size)
+         } catch (e: kotlin.coroutines.cancellation.CancellationException) {
+             throw e
+@@ -367,6 +388,48 @@ class TAKMeshIntegration(
+         }
+     }
+ 
++    /** Deletes the icons of remote TAK users whose PLI hasn't been heard within [TakPrefs.takUserMaxAgeMinutes]. */
++    private suspend fun expireQuietTakUsers() {
++        val maxAgeMinutes = takPrefs.takUserMaxAgeMinutes.value
++        if (maxAgeMinutes <= 0) return
++        // Keep them tracked until a client is attached to delete from.
++        if (takServerManager.connectionCount.value <= 0) return
++        val gone = userExpiryMutex.withLock { userExpiry.expire(maxAgeMinutes.minutes) }
++        if (gone.isEmpty()) return
++        val at = Clock.System.now()
++        gone.forEach { (uid, type) -> takServerManager.broadcastRawXml(deleteCotXml(uid, type, at)) }
++        Logger.i { "Removed ${gone.size} TAK user(s) not heard in $maxAgeMinutes min" }
++    }
++
++    /**
++     * Pick the mesh destination for an outbound v2 packet: the recipient's node for directed traffic whose addressees
++     * all sit behind one known node, otherwise broadcast. Decodes our own wire payload so the decision uses exactly
++     * what receivers will see. Payloads over [MAX_UNICAST_TAK_WIRE_PAYLOAD_BYTES] stay broadcast, because firmware
++     * PKI-encrypts unicast (+12 bytes) and rejects the packet as TOO_LARGE rather than falling back.
++     */
++    private fun resolveV2Destination(wirePayload: ByteArray): String {
++        if (wirePayload.size > MAX_UNICAST_TAK_WIRE_PAYLOAD_BYTES) return NodeAddress.ID_BROADCAST
++        val recipients =
++            try {
++                TakRecipients.of(TakV2Compressor.decompressToData(wirePayload))
++            } catch (e: Exception) {
++                Logger.w(e) { "Could not decode outbound TAK packet for routing; broadcasting" }
++                return NodeAddress.ID_BROADCAST
++            }
++        val ownNode = nodeRepository.myNodeInfo.value?.myNodeNum
++        val node = directedRouter.unicastTargetFor(recipients, ownNode) ?: return NodeAddress.ID_BROADCAST
++        return NodeAddress.numToDefaultId(node)
++    }
++
++    /** Remember which UIDs/callsigns belong to the ATAK user(s) on this phone, for receive-side filtering. */
++    private fun learnLocalIdentity(cotMessage: CoTMessage, clientInfo: TAKClientInfo?) {
++        clientInfo?.let { directedRouter.learnLocal(it.uid, it.callsign) }
++        // The local EUD's own position report: event uid is its device uid.
++        if (cotMessage.type.startsWith("a-f-G") && cotMessage.chat == null) {
++            directedRouter.learnLocal(cotMessage.uid, cotMessage.contact?.callsign)
++        }
++    }
++
+     /**
+      * Wrap a [org.meshtastic.proto.TAKPacketV2] into the uncompressed v2 wire format: `[0xFF flag byte][raw protobuf]`.
+      * Used as a fallback when the zstd native lib isn't loaded.
+@@ -385,20 +448,32 @@ class TAKMeshIntegration(
+         val payload = packet.decoded?.payload ?: return
+ 
+         when (packet.decoded?.portnum) {
+-            PortNum.ATAK_PLUGIN_V2 -> handleV2Packet(payload.toByteArray())
++            PortNum.ATAK_PLUGIN_V2 -> handleV2Packet(packet.from, payload.toByteArray())
+             PortNum.ATAK_PLUGIN -> handleV1Packet(payload)
+             else -> return
+         }
+     }
+ 
+-    private suspend fun handleV2Packet(wirePayload: ByteArray) {
++    private suspend fun handleV2Packet(fromNode: Int, wirePayload: ByteArray) {
+         try {
+             // Decompress to CoT XML via the SDK's CotXmlBuilder, which handles
+             // ALL typed payloads (DrawnShape, Marker, Route, etc.) and preserves
+             // shape detail elements (vertices, colors, stroke weight) that the
+             // app's own CoTXmlParser would strip. Forward the SDK-generated XML
+             // directly to TAK clients without re-parsing.
+-            val rawXml = TakV2Compressor.decompressToXml(wirePayload)
++            val data = TakV2Compressor.decompressToData(wirePayload)
++            directedRouter.learnPeer(fromNode, data)
++            if (directedRouter.isSelfPli(data) && data.uid.isNotEmpty()) {
++                val type = data.cotTypeStr ?: CotTypeMapper.typeToString(data.cotTypeId) ?: DEFAULT_PLI_COT_TYPE
++                userExpiryMutex.withLock { userExpiry.heard(data.uid, type) }
++            }
++            meshToCotBroadcaster.setTakClientNodes(directedRouter.clientNodes())
++            val recipients = TakRecipients.of(data)
++            if (!directedRouter.shouldDeliverLocally(recipients)) {
++                Logger.d { "Dropped directed CoT addressed to someone else: $recipients" }
++                return
++            }
++            val rawXml = TakV2Compressor.dataToXml(data)
+             // Normalize for the TAK TCP stream — drop the <?xml ...?> prologue
+             // and collapse inter-tag whitespace so ATAK's streaming parser sees
+             // bare <event>...</event> on a single line. Centralized in the SDK.
+@@ -451,6 +526,7 @@ class TAKMeshIntegration(
+     }
+ 
+     companion object {
++        private const val TAK_USER_EXPIRY_CHECK_MS = 60_000L
+         /**
+          * Minimum stale TTL (5 min) for static CoT types sent over mesh. iTAK uses 2-min stale for routes/shapes; over
+          * LoRa mesh with multi-hop relay, these arrive past stale and ATAK discards them. PLI and GeoChat are left
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKServerManager.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKServerManager.kt
+index 0bd99ef..804b769 100644
+--- a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKServerManager.kt
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TAKServerManager.kt
+@@ -32,6 +32,25 @@ import kotlin.time.Clock
+ import kotlin.time.Duration.Companion.minutes
+ 
+ /** A CoT message received from a connected TAK client, paired with the client's identity. */
++private val NO_START_ERROR_REASON: StateFlow<String?> = MutableStateFlow(null)
++
++/**
++ * Turns a TAK server start failure into something an operator can act on. The common case is another app (often a
++ * second copy of Meshtastic) already holding the port.
++ */
++internal fun describeStartFailure(error: Throwable?): String? {
++    if (error == null) return null
++    val text = generateSequence(error) { it.cause }.joinToString(" ") { "${it::class.simpleName} ${it.message}" }
++    return when {
++        text.contains("BindException") || text.contains("in use", ignoreCase = true) ->
++            "Port $DEFAULT_TAK_PORT is already in use by another app — most likely another copy of Meshtastic " +
++                "with its TAK server on. Close it, then turn the TAK server off and on."
++        text.contains("certificate", ignoreCase = true) ->
++            "The TAK server's TLS certificates could not be loaded."
++        else -> error.message
++    }
++}
++
+ data class InboundCoTMessage(val cotMessage: CoTMessage, val clientInfo: TAKClientInfo? = null)
+ 
+ interface TAKServerManager {
+@@ -40,6 +59,10 @@ interface TAKServerManager {
+     val isStarting: StateFlow<Boolean>
+     val connectionCount: StateFlow<Int>
+     val hasStartError: StateFlow<Boolean>
++
++    /** Plain-language reason for the last start failure (e.g. port already in use), or null. */
++    val startErrorReason: StateFlow<String?>
++        get() = NO_START_ERROR_REASON
+     val inboundMessages: SharedFlow<InboundCoTMessage>
+ 
+     /**
+@@ -81,6 +104,9 @@ internal class TAKServerManagerImpl(private val takServer: TAKServer) : TAKServe
+     private val _hasStartError = MutableStateFlow(false)
+     override val hasStartError: StateFlow<Boolean> = _hasStartError.asStateFlow()
+ 
++    private val _startErrorReason = MutableStateFlow<String?>(null)
++    override val startErrorReason: StateFlow<String?> = _startErrorReason.asStateFlow()
++
+     private val _inboundMessages = MutableSharedFlow<InboundCoTMessage>(extraBufferCapacity = 64)
+     override val inboundMessages: SharedFlow<InboundCoTMessage> = _inboundMessages.asSharedFlow()
+ 
+@@ -108,6 +134,7 @@ internal class TAKServerManagerImpl(private val takServer: TAKServer) : TAKServe
+             return
+         }
+         _hasStartError.value = false
++        _startErrorReason.value = null
+         _isStarting.value = true
+         val generation = ++startGeneration
+         // Assign scope AFTER the guard so a second concurrent start() can never
+@@ -142,6 +169,7 @@ internal class TAKServerManagerImpl(private val takServer: TAKServer) : TAKServe
+                     Logger.i { "TAK Server started" }
+                 } else {
+                     _hasStartError.value = true
++                    _startErrorReason.value = describeStartFailure(result.exceptionOrNull())
+                     Logger.e(result.exceptionOrNull()) { "Failed to start TAK Server" }
+                     // Clear both callbacks if start failed so we don't hold a reference unnecessarily
+                     takServer.onMessage = null
+@@ -160,6 +188,7 @@ internal class TAKServerManagerImpl(private val takServer: TAKServer) : TAKServe
+         _isRunning.value = false
+         _isStarting.value = false
+         _hasStartError.value = false
++        _startErrorReason.value = null
+         scope = null
+         takServer.onMessage = null
+         takServer.onClientConnected = null
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakDirectedRouting.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakDirectedRouting.kt
+new file mode 100644
+index 0000000..6af32ca
+--- /dev/null
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakDirectedRouting.kt
+@@ -0,0 +1,195 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.core.takserver
++
++import org.meshtastic.tak.CotTypeMapper
++import org.meshtastic.tak.TakPacketV2Data
++import kotlin.concurrent.atomics.AtomicReference
++import kotlin.concurrent.atomics.ExperimentalAtomicApi
++import kotlin.time.Clock
++import kotlin.time.Duration
++import kotlin.time.Duration.Companion.minutes
++import kotlin.time.Instant
++
++/**
++ * The addressees of one TAK event, as ATAK expressed them.
++ *
++ * - [uids]: the GeoChat `__chat[@id]` of a direct message (the recipient's ATAK UID). Empty for "All Chat Rooms".
++ * - [callsigns]: the `<marti><dest callsign=…/>` list ATAK attaches to directed traffic (DMs, receipts, TAK-Talk).
++ *
++ * Both empty means the event is for everyone (PLI, All Chat Rooms, markers, …).
++ */
++internal data class TakRecipients(val uids: Set<String>, val callsigns: Set<String>) {
++    val isBroadcast: Boolean
++        get() = uids.isEmpty() && callsigns.isEmpty()
++
++    companion object {
++        private const val ALL_CHAT_ROOMS = "All Chat Rooms"
++
++        fun of(data: TakPacketV2Data): TakRecipients {
++            val chatTo =
++                (data.payload as? TakPacketV2Data.Payload.Chat)?.to?.takeIf { it.isNotEmpty() && it != ALL_CHAT_ROOMS }
++            return TakRecipients(
++                uids = setOfNotNull(chatTo),
++                callsigns = data.marti.filter { it.isNotEmpty() }.toSet(),
++            )
++        }
++    }
++}
++
++/**
++ * Directed routing for TAK traffic over the mesh — the job a real TAK Server does with `<marti>` and that the
++ * phone-local bridge otherwise skips.
++ *
++ * Without it, every GeoChat DM is sent to the mesh broadcast address and every receiving phone hands it to its ATAK,
++ * which files it as a DM — so a message to one person shows up in everyone's DMs.
++ *
++ * Two independent fixes, each enough on its own when it applies:
++ * 1. **Send side** ([unicastTargetFor]): if every addressee maps to one known mesh node, send to that node instead of
++ *    broadcast. Firmware only hands a packet to the phone when it is broadcast or addressed to that node
++ *    (`RoutingModule.cpp`), so other phones never see it — even if they run an unpatched app — and firmware 2.5+
++ *    PKI-encrypts it to the recipient.
++ * 2. **Receive side** ([shouldDeliverLocally]): when a directed event still arrives as a broadcast (unknown recipient,
++ *    group message, oversized, older sender app), drop it unless it is addressed to this phone's ATAK user.
++ *
++ * Both sides fail open: when something is unknown, behaviour is exactly the stock broadcast-to-all.
++ *
++ * Peers (remote ATAK users) are learned from their own TAK traffic arriving off the mesh: the mesh packet's `from` node
++ * plus the PLI uid/callsign or the GeoChat sender uid. Local users are learned from what the local ATAK client sends
++ * us. Entries expire after [peerTtl] so a user who moves to a different radio falls back to broadcast rather than
++ * being unicast to a node they no longer carry.
++ */
++@OptIn(ExperimentalAtomicApi::class)
++internal class TakDirectedRouter(
++    private val peerTtl: Duration = DEFAULT_PEER_TTL,
++    private val maxPeers: Int = DEFAULT_MAX_PEERS,
++    private val now: () -> Instant = { Clock.System.now() },
++) {
++    private data class PeerEntry(val node: Int, val seenAt: Instant)
++
++    // Copy-on-write maps behind atomic references: written from the mesh collector, read from the TAK-client
++    // collector. Kotlin's default Map is insertion-ordered, which the eviction in [withEntry] relies on.
++    private val peerByUid = AtomicReference(emptyMap<String, PeerEntry>())
++    private val peerByCallsign = AtomicReference(emptyMap<String, PeerEntry>())
++    private val localUids = AtomicReference(emptySet<String>())
++    private val localCallsigns = AtomicReference(emptySet<String>())
++
++    /** Record an identity of an ATAK client connected to this phone's TAK server. */
++    fun learnLocal(uid: String?, callsign: String?) {
++        uid?.takeIf { it.isNotEmpty() && !it.startsWith(GEOCHAT_PREFIX) }?.let { u -> localUids.mutate { it + u } }
++        callsign?.takeIf { it.isNotEmpty() }?.let { c -> localCallsigns.mutate { it + c } }
++    }
++
++    /** Record which mesh node a remote ATAK user is behind, from a TAK packet that node originated. */
++    fun learnPeer(fromNode: Int, data: TakPacketV2Data) {
++        if (fromNode == 0 || fromNode == NODENUM_BROADCAST) return
++        val uid: String
++        val callsign: String
++        when {
++            // GeoChat event uid is GeoChat.<senderUid>.<chatroom>.<messageId>
++            data.uid.startsWith(GEOCHAT_PREFIX) -> {
++                uid = data.uid.split(".", limit = GEOCHAT_UID_PARTS).getOrNull(1) ?: return
++                callsign = (data.payload as? TakPacketV2Data.Payload.Chat)?.toCallsign ?: data.callsign
++            }
++            // Self-reported position (PLI) of a friendly ground EUD: event uid is the device uid.
++            isSelfPli(data) -> {
++                uid = data.uid
++                callsign = data.callsign
++            }
++            else -> return
++        }
++        if (uid.isEmpty()) return
++        val entry = PeerEntry(fromNode, now())
++        peerByUid.mutate { it.withEntry(uid, entry, maxPeers) }
++        callsign.takeIf { it.isNotEmpty() }?.let { cs -> peerByCallsign.mutate { it.withEntry(cs, entry, maxPeers) } }
++    }
++
++    /**
++     * Should an event that arrived from the mesh be handed to this phone's ATAK?
++     *
++     * Only returns false when we are confident it is addressed to someone else.
++     */
++    fun shouldDeliverLocally(recipients: TakRecipients): Boolean {
++        if (recipients.isBroadcast) return true
++        val uids = localUids.load()
++        val callsigns = localCallsigns.load()
++        // Local ATAK hasn't identified itself yet — can't judge, keep stock behaviour.
++        if (uids.isEmpty() && callsigns.isEmpty()) return true
++        if (recipients.uids.any { it in uids } || recipients.callsigns.any { it in callsigns }) return true
++        // ATAK named the recipients explicitly (<marti>) and we're not among them.
++        if (recipients.callsigns.isNotEmpty()) return false
++        // A DM to an ATAK user we know is someone else.
++        val peers = peerByUid.load()
++        if (recipients.uids.any { it in peers }) return false
++        // Unknown room/group id (team chat, custom group): keep stock behaviour.
++        return true
++    }
++
++    /**
++     * The single mesh node every addressee is behind, or null to broadcast. Null when any addressee is unknown or
++     * stale, when they span more than one node, or when the only node is our own.
++     */
++    /** Mesh nodes a TAK client's own traffic (PLI or chat) was heard from within the peer TTL. */
++    fun clientNodes(): Set<Int> {
++        val cutoff = now() - peerTtl
++        return peerByUid.load().values.filter { it.seenAt >= cutoff }.mapTo(mutableSetOf()) { it.node }
++    }
++
++    fun unicastTargetFor(recipients: TakRecipients, ownNode: Int?): Int? {
++        if (recipients.isBroadcast) return null
++        val cutoff = now() - peerTtl
++        val byUid = peerByUid.load()
++        val byCallsign = peerByCallsign.load()
++        val nodes = mutableSetOf<Int>()
++        for (uid in recipients.uids) nodes += byUid[uid]?.takeIf { it.seenAt >= cutoff }?.node ?: return null
++        for (cs in recipients.callsigns) nodes += byCallsign[cs]?.takeIf { it.seenAt >= cutoff }?.node ?: return null
++        val node = nodes.singleOrNull() ?: return null
++        return node.takeIf { it != ownNode }
++    }
++
++    /** True for a friendly ground EUD's own position report (event uid = device uid). */
++    fun isSelfPli(data: TakPacketV2Data): Boolean {
++        val payloadIsPli = data.payload is TakPacketV2Data.Payload.Pli || data.payload is TakPacketV2Data.Payload.None
++        val type = data.cotTypeStr ?: CotTypeMapper.typeToString(data.cotTypeId)
++        return payloadIsPli && type != null && type.startsWith(FRIENDLY_GROUND_PREFIX) && data.callsign.isNotEmpty()
++    }
++
++    companion object {
++        val DEFAULT_PEER_TTL: Duration = 30.minutes
++        const val DEFAULT_MAX_PEERS: Int = 256
++        private const val GEOCHAT_PREFIX = "GeoChat."
++        private const val GEOCHAT_UID_PARTS = 4
++        private const val FRIENDLY_GROUND_PREFIX = "a-f-G"
++        private const val NODENUM_BROADCAST = -1 // 0xFFFFFFFF as a signed Int
++
++        // CAS loop; compareAndSet compares by identity, which is what we want for the loaded snapshot.
++        private inline fun <T> AtomicReference<T>.mutate(transform: (T) -> T) {
++            while (true) {
++                val current = load()
++                if (compareAndSet(current, transform(current))) return
++            }
++        }
++
++        private fun <K, V> Map<K, V>.withEntry(key: K, value: V, cap: Int): Map<K, V> {
++            val m = LinkedHashMap(this)
++            m.remove(key) // re-insert so the most recently seen entry is last
++            m[key] = value
++            while (m.size > cap) m.remove(m.keys.first())
++            return m
++        }
++    }
++}
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakUserExpiry.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakUserExpiry.kt
+new file mode 100644
+index 0000000..47cd33e
+--- /dev/null
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakUserExpiry.kt
+@@ -0,0 +1,49 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.core.takserver
++
++import kotlin.time.Duration
++import kotlin.time.Instant
++
++/**
++ * Remembers when each remote TAK user's position (PLI) was last heard over the mesh, so their icon can be removed from
++ * the local TAK map once they go quiet instead of lingering greyed-out. Not thread-safe; callers serialize access.
++ */
++internal class TakUserExpiry(private val now: () -> Instant, private val maxUsers: Int = DEFAULT_MAX_USERS) {
++    private data class Seen(val type: String, val at: Instant)
++
++    // Insertion-ordered; re-inserted on every sighting so the oldest entry is first.
++    private val seen = LinkedHashMap<String, Seen>()
++
++    fun heard(uid: String, type: String) {
++        seen.remove(uid)
++        seen[uid] = Seen(type, now())
++        while (seen.size > maxUsers) seen.remove(seen.keys.first())
++    }
++
++    /** Removes and returns (uid, CoT type) of every user not heard within [maxAge]. */
++    fun expire(maxAge: Duration): List<Pair<String, String>> {
++        val cutoff = now() - maxAge
++        val gone = seen.filterValues { it.at < cutoff }
++        gone.keys.forEach { seen.remove(it) }
++        return gone.map { (uid, s) -> uid to s.type }
++    }
++
++    companion object {
++        const val DEFAULT_MAX_USERS = 512
++    }
++}
+diff --git a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakV2Compressor.kt b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakV2Compressor.kt
+index b373d37..b08fcf4 100644
+--- a/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakV2Compressor.kt
++++ b/core/takserver/src/commonMain/kotlin/org/meshtastic/core/takserver/TakV2Compressor.kt
+@@ -87,6 +87,12 @@ internal object TakV2Compressor {
+      */
+     fun decompressToXml(wirePayload: ByteArray): String = CotXmlBuilder().build(sdkCompressor.decompress(wirePayload))
+ 
++    /** Decompress to the SDK model so callers can inspect addressing before (or instead of) building XML. */
++    fun decompressToData(wirePayload: ByteArray): TakPacketV2Data = sdkCompressor.decompress(wirePayload)
++
++    /** Build CoT XML from an already-decompressed packet; same output as [decompressToXml]. */
++    fun dataToXml(data: TakPacketV2Data): String = CotXmlBuilder().build(data)
++
+     /** Convert Wire-generated TAKPacketV2 → SDK's TakPacketV2Data. */
+     private fun wireToSdkData(packet: TAKPacketV2): TakPacketV2Data {
+         val cotTypeId = packet.cot_type_id.value
+diff --git a/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/MeshBreadcrumbsTest.kt b/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/MeshBreadcrumbsTest.kt
+new file mode 100644
+index 0000000..cc07b8e
+--- /dev/null
++++ b/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/MeshBreadcrumbsTest.kt
+@@ -0,0 +1,435 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.core.takserver
++
++import kotlinx.coroutines.test.TestScope
++import kotlinx.coroutines.test.UnconfinedTestDispatcher
++import kotlinx.coroutines.test.advanceTimeBy
++import kotlinx.coroutines.test.runCurrent
++import kotlinx.coroutines.test.runTest
++import org.meshtastic.core.di.CoroutineDispatchers
++import org.meshtastic.core.model.Node
++import org.meshtastic.core.repository.MeshToCotRadioMode
++import org.meshtastic.core.testing.FakeNodeRepository
++import org.meshtastic.core.testing.FakeTakPrefs
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNotNull
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++import kotlin.time.Duration.Companion.hours
++import kotlin.time.Duration.Companion.minutes
++import kotlin.time.Duration.Companion.seconds
++import kotlin.time.Instant
++
++class MeshBreadcrumbsTest {
++
++    private var clock = Instant.fromEpochSeconds(1_800_000_000)
++    private val settings = BreadcrumbSettings(interval = 60.seconds, keepFor = 6.hours, colorArgb = -65536)
++
++    // ── Selection ───────────────────────────────────────────────────────────
++
++    @Test
++    fun `all radios are shown unless only-selected is on`() {
++        assertTrue(MeshToCotSelection().isShown(DOG))
++        val selected = MeshToCotSelection(onlySelected = true, shownNodes = setOf(RELAY))
++        assertTrue(selected.isShown(RELAY))
++        assertFalse(selected.isShown(DOG))
++    }
++
++    @Test
++    fun `a radio with a trail is always shown`() {
++        val selection = MeshToCotSelection(onlySelected = true, shownNodes = emptySet(), trailNodes = setOf(DOG))
++        assertTrue(selection.isShown(DOG))
++        assertTrue(selection.hasTrail(DOG))
++    }
++
++    @Test
++    fun `clients only hides every radio except trail radios`() {
++        val selection = MeshToCotSelection(mode = MeshToCotRadioMode.CLIENTS_ONLY, trailNodes = setOf(DOG))
++        assertFalse(selection.isShown(RELAY))
++        assertTrue(selection.isShown(DOG))
++    }
++
++    @Test
++    fun `radios without a client hides radios that carry a TAK client`() {
++        val selection =
++            MeshToCotSelection(mode = MeshToCotRadioMode.CLIENTS_AND_RADIOS_WITHOUT_CLIENT, clientNodes = setOf(RELAY))
++        assertFalse(selection.isShown(RELAY), "radio carrying an ATAK user is hidden")
++        assertTrue(selection.isShown(DOG), "standalone tracker is shown")
++    }
++
++    @Test
++    fun `mode and picker combine`() {
++        val selection =
++            MeshToCotSelection(
++                mode = MeshToCotRadioMode.CLIENTS_AND_RADIOS_WITHOUT_CLIENT,
++                onlySelected = true,
++                shownNodes = setOf(DOG, RELAY),
++                clientNodes = setOf(RELAY),
++            )
++        assertTrue(selection.isShown(DOG))
++        assertFalse(selection.isShown(RELAY))
++        assertFalse(selection.isShown(0x1234), "not picked")
++    }
++
++    // ── Trail ───────────────────────────────────────────────────────────────
++
++    @Test
++    fun `first position drops a crumb immediately`() {
++        val trail = BreadcrumbTrail { clock }
++        assertNotNull(trail.maybeDrop(DOG, "DOG - Rex", LAT, LON, settings))
++    }
++
++    @Test
++    fun `no crumb before the interval even if moved`() {
++        val trail = BreadcrumbTrail { clock }
++        trail.maybeDrop(DOG, "DOG", LAT, LON, settings)
++        clock += 30.seconds
++        assertNull(trail.maybeDrop(DOG, "DOG", LAT + 1000, LON, settings))
++    }
++
++    @Test
++    fun `a parked radio does not stack crumbs`() {
++        val trail = BreadcrumbTrail { clock }
++        trail.maybeDrop(DOG, "DOG", LAT, LON, settings)
++        clock += 10.minutes
++        assertNull(trail.maybeDrop(DOG, "DOG", LAT, LON, settings))
++    }
++
++    @Test
++    fun `moved after the interval drops a new crumb with a unique uid`() {
++        val trail = BreadcrumbTrail { clock }
++        val first = trail.maybeDrop(DOG, "DOG", LAT, LON, settings)!!
++        clock += 61.seconds
++        val second = trail.maybeDrop(DOG, "DOG", LAT + 1000, LON, settings)!!
++        assertTrue(first.uid != second.uid)
++        assertEquals(2, trail.all().size)
++    }
++
++    @Test
++    fun `crumbs expire after the keep time`() {
++        val trail = BreadcrumbTrail { clock }
++        trail.maybeDrop(DOG, "DOG", LAT, LON, settings)
++        clock += 7.hours
++        trail.expire(settings.keepFor)
++        assertTrue(trail.all().isEmpty())
++        assertTrue(trail.nodes().isEmpty())
++    }
++
++    @Test
++    fun `removing a radio returns its crumbs`() {
++        val trail = BreadcrumbTrail { clock }
++        trail.maybeDrop(DOG, "DOG", LAT, LON, settings)
++        trail.maybeDrop(RELAY, "RLY", LAT, LON, settings)
++        assertEquals(1, trail.removeNode(DOG).size)
++        assertEquals(setOf(RELAY), trail.nodes())
++    }
++
++    @Test
++    fun `crumb xml is a coloured spot marker that goes stale at the keep time`() {
++        val trail = BreadcrumbTrail { clock }
++        val xml = trail.maybeDrop(DOG, "DOG - Rex", LAT, LON, settings)!!.xml
++        assertTrue(xml.contains("type='b-m-p-s-m'"), xml)
++        assertTrue(xml.contains("<color argb='-65536'/>"), xml)
++        assertTrue(xml.contains("COT_MAPPING_SPOTMAP/b-m-p-s-m/-65536"), xml)
++        assertTrue(xml.contains("stale='2027-01-15T14:00:00.000Z'"), xml)
++        assertTrue(xml.contains("callsign='DOG "), "label is the short name plus time: $xml")
++        assertTrue(xml.contains("uid='${meshNodeCotUid(DOG)}'"), "links back to the radio: $xml")
++        assertFalse(xml.contains("<?xml"), "CoT stream events must not carry an XML declaration")
++    }
++
++    @Test
++    fun `delete xml targets the given uid`() {
++        val xml = deleteCotXml("MESHTASTIC-0000BEEF", "a-f-G-U-C", clock)
++        assertTrue(xml.contains("type='t-x-d-d'"), xml)
++        assertTrue(xml.contains("<link relation='p-p' uid='MESHTASTIC-0000BEEF' type='a-f-G-U-C'/>"), xml)
++    }
++
++    @Test
++    fun `node uid helper matches Node cotUid`() {
++        assertEquals("MESHTASTIC-A1B2C3D4", meshNodeCotUid(0xa1b2c3d4.toInt()))
++        assertEquals("MESHTASTIC-0000BEEF", meshNodeCotUid(0xbeef))
++    }
++
++    @Test
++    fun `no crumb until the radio has moved the minimum distance`() {
++        val trail = BreadcrumbTrail { clock }
++        val tenMetres = settings.copy(minDistanceMeters = 10)
++        trail.maybeDrop(DOG, "DOG", LAT, LON, tenMetres)
++        clock += 2.minutes
++        assertNull(trail.maybeDrop(DOG, "DOG", LAT + 300, LON, tenMetres), "~3 m of jitter is ignored")
++        assertNotNull(trail.maybeDrop(DOG, "DOG", LAT + 1500, LON, tenMetres), "~17 m is a real move")
++    }
++
++    @Test
++    fun `distance helper is roughly right`() {
++        // 0.001 degrees of latitude is about 111 m.
++        val d = distanceMeters(LAT, LON, LAT + 10_000, LON)
++        assertTrue(d in 105.0..117.0, "got $d")
++    }
++
++    @Test
++    fun `keep forever saves the dot and signal goes in the details`() {
++        val trail = BreadcrumbTrail { clock }
++        val forever = settings.copy(keepForever = true)
++        val xml = trail.maybeDrop(DOG, "DOG", LAT, LON, forever, signal = "SNR: 6.5 dB | Hops: 1")!!.xml
++        assertTrue(xml.contains("<archive/>"), xml)
++        assertTrue(xml.contains("SNR: 6.5 dB | Hops: 1"), xml)
++        assertFalse(trail.maybeDrop(RELAY, "RLY", LAT, LON, settings)!!.xml.contains("<archive/>"))
++    }
++
++    @Test
++    fun `quiet TAK users expire`() {
++        val users = TakUserExpiry({ clock })
++        users.heard("ANDROID-a", "a-f-G-U-C")
++        clock += 10.minutes
++        users.heard("ANDROID-b", "a-f-G-U-C")
++        clock += 25.minutes
++        assertEquals(listOf("ANDROID-a" to "a-f-G-U-C"), users.expire(30.minutes))
++        assertTrue(users.expire(30.minutes).isEmpty(), "already removed")
++    }
++
++    @Test
++    fun `port in use gets a plain-language reason`() {
++        val reason = describeStartFailure(IllegalStateException("bind failed", RuntimeException("Address already in use")))
++        assertTrue(reason!!.contains("Port 8089 is already in use"), reason)
++        assertNull(describeStartFailure(null))
++    }
++
++    @Test
++    fun `radio details include last heard and hops`() {
++        val remarks = radio(DOG).copy(hopsAway = 2).toCoTMessage().remarks!!
++        assertTrue(remarks.startsWith("Last heard: "), remarks)
++        assertTrue(remarks.contains("Hops: 2"), remarks)
++    }
++
++    // ── Broadcaster integration ─────────────────────────────────────────────
++
++    private class Harness(val scope: TestScope, now: () -> Instant) {
++        val serverManager = FakeTAKServerManager()
++        val nodeRepository = FakeNodeRepository()
++        val takPrefs = FakeTakPrefs()
++        private val dispatcher = UnconfinedTestDispatcher(scope.testScheduler)
++        val broadcaster =
++            MeshToCotBroadcaster(
++                takServerManager = serverManager,
++                nodeRepository = nodeRepository,
++                takPrefs = takPrefs,
++                dispatchers = CoroutineDispatchers(io = dispatcher, main = dispatcher, default = dispatcher),
++                now = now,
++            )
++
++        init {
++            serverManager.connections.value = 1
++            takPrefs.isMeshToCotEnabled.value = true
++        }
++
++        fun settle() {
++            scope.advanceTimeBy(1_000L)
++            scope.runCurrent()
++        }
++    }
++
++    @Test
++    fun `only selected radios are published`() = runTest {
++        val h = Harness(this) { clock }
++        h.takPrefs.meshToCotOnlySelected.value = true
++        h.takPrefs.meshToCotShownNodes.value = setOf(RELAY)
++        h.nodeRepository.setNodes(listOf(radio(DOG), radio(RELAY)))
++
++        h.broadcaster.start(backgroundScope)
++        h.settle()
++
++        assertEquals(listOf(meshNodeCotUid(RELAY)), h.serverManager.broadcasts.map { it.uid })
++    }
++
++    @Test
++    fun `hiding a radio deletes its marker from the map`() = runTest {
++        val h = Harness(this) { clock }
++        h.nodeRepository.setNodes(listOf(radio(DOG), radio(RELAY)))
++        h.broadcaster.start(backgroundScope)
++        h.settle()
++        assertEquals(2, h.serverManager.broadcasts.size)
++
++        h.takPrefs.meshToCotShownNodes.value = setOf(RELAY)
++        h.takPrefs.meshToCotOnlySelected.value = true
++        h.settle()
++
++        val deletes = h.serverManager.rawBroadcasts.filter { it.contains("t-x-d-d") }
++        assertEquals(1, deletes.size, "${h.serverManager.rawBroadcasts}")
++        assertTrue(deletes.single().contains("uid='${meshNodeCotUid(DOG)}'"))
++    }
++
++    @Test
++    fun `a radio that gains a TAK client is removed in radios-without-client mode`() = runTest {
++        val h = Harness(this) { clock }
++        h.takPrefs.meshToCotRadioMode.value = MeshToCotRadioMode.CLIENTS_AND_RADIOS_WITHOUT_CLIENT
++        h.nodeRepository.setNodes(listOf(radio(DOG), radio(RELAY)))
++        h.broadcaster.start(backgroundScope)
++        h.settle()
++        assertEquals(2, h.serverManager.broadcasts.size)
++
++        h.broadcaster.setTakClientNodes(setOf(RELAY))
++        h.settle()
++
++        val deletes = h.serverManager.rawBroadcasts.filter { it.contains("t-x-d-d") }
++        assertEquals(1, deletes.size, "${h.serverManager.rawBroadcasts}")
++        assertTrue(deletes.single().contains("uid='${meshNodeCotUid(RELAY)}'"))
++    }
++
++    @Test
++    fun `a radio not heard within the max age is deleted from the map`() = runTest {
++        val h = Harness(this) { clock }
++        h.takPrefs.meshToCotMaxAgeMinutes.value = 30
++        h.nodeRepository.setNodes(listOf(radio(DOG), radio(RELAY)))
++        h.broadcaster.start(backgroundScope)
++        h.settle()
++        assertEquals(2, h.serverManager.broadcasts.size)
++
++        // 31 minutes later DOG has been heard again, RELAY has not.
++        clock += 31.minutes
++        h.nodeRepository.setNodes(listOf(radio(DOG, heardAt = clock), radio(RELAY, heardAt = clock - 31.minutes)))
++        h.settle()
++
++        val deletes = h.serverManager.rawBroadcasts.filter { it.contains("t-x-d-d") }
++        assertEquals(1, deletes.size, "${h.serverManager.rawBroadcasts}")
++        assertTrue(deletes.single().contains("uid='${meshNodeCotUid(RELAY)}'"))
++    }
++
++    @Test
++    fun `leftover markers for our own and hidden radios are deleted on enable`() = runTest {
++        val h = Harness(this) { clock }
++        h.nodeRepository.setMyNodeInfo(myNodeInfo(OURS))
++        h.takPrefs.meshToCotRadioMode.value = MeshToCotRadioMode.CLIENTS_ONLY
++        h.nodeRepository.setNodes(listOf(radio(OURS), radio(RELAY)))
++        h.broadcaster.start(backgroundScope)
++        h.settle()
++
++        val deleted = h.serverManager.rawBroadcasts.filter { it.contains("t-x-d-d") }
++        assertTrue(deleted.any { it.contains("uid='${meshNodeCotUid(OURS)}'") }, "own radio: $deleted")
++        assertTrue(deleted.any { it.contains("uid='${meshNodeCotUid(RELAY)}'") }, "hidden radio: $deleted")
++        assertTrue(h.serverManager.broadcasts.isEmpty(), "clients only publishes no radio markers")
++    }
++
++    @Test
++    fun `a saved 30 second interval acts as one minute`() = runTest {
++        val h = Harness(this) { clock }
++        h.takPrefs.breadcrumbIntervalSeconds.value = 30
++        h.takPrefs.breadcrumbNodes.value = setOf(DOG)
++        h.nodeRepository.setNodes(listOf(radio(DOG)))
++        h.broadcaster.start(backgroundScope)
++        h.settle()
++
++        clock += 31.seconds
++        h.nodeRepository.setNodes(listOf(radio(DOG, latitudeI = LAT + 2000)))
++        h.settle()
++        assertEquals(1, h.serverManager.rawBroadcasts.count { it.contains("b-m-p-s-m") }, "no dot before a minute")
++
++        clock += 30.seconds
++        h.nodeRepository.setNodes(listOf(radio(DOG, latitudeI = LAT + 4000)))
++        h.settle()
++        assertEquals(2, h.serverManager.rawBroadcasts.count { it.contains("b-m-p-s-m") })
++    }
++
++    @Test
++    fun `a trail radio drops crumbs as it moves`() = runTest {
++        val h = Harness(this) { clock }
++        h.takPrefs.breadcrumbNodes.value = setOf(DOG)
++        h.nodeRepository.setNodes(listOf(radio(DOG)))
++        h.broadcaster.start(backgroundScope)
++        h.settle()
++
++        clock += 61.seconds
++        h.nodeRepository.setNodes(listOf(radio(DOG, latitudeI = LAT + 2000)))
++        h.settle()
++
++        val crumbs = h.serverManager.rawBroadcasts.filter { it.contains("b-m-p-s-m") && !it.contains("t-x-d-d") }
++        assertEquals(2, crumbs.size, "${h.serverManager.rawBroadcasts}")
++    }
++
++    @Test
++    fun `crumbs are recorded without a client and replayed on connect`() = runTest {
++        val h = Harness(this) { clock }
++        h.serverManager.connections.value = 0
++        h.takPrefs.breadcrumbNodes.value = setOf(DOG)
++        h.nodeRepository.setNodes(listOf(radio(DOG)))
++        h.broadcaster.start(backgroundScope)
++        h.settle()
++        assertTrue(h.serverManager.rawBroadcasts.isEmpty())
++
++        h.serverManager.connections.value = 1
++        h.serverManager.emitClientConnected()
++        h.settle()
++
++        assertEquals(1, h.serverManager.rawBroadcasts.count { it.contains("b-m-p-s-m") })
++    }
++
++    @Test
++    fun `turning a trail off deletes its crumbs`() = runTest {
++        val h = Harness(this) { clock }
++        h.takPrefs.breadcrumbNodes.value = setOf(DOG)
++        h.nodeRepository.setNodes(listOf(radio(DOG)))
++        h.broadcaster.start(backgroundScope)
++        h.settle()
++
++        h.takPrefs.breadcrumbNodes.value = emptySet()
++        h.settle()
++
++        assertTrue(h.serverManager.rawBroadcasts.any { it.contains("t-x-d-d") && it.contains("-trail-") })
++    }
++
++    private fun radio(num: Int, latitudeI: Int = LAT, heardAt: Instant = clock) = Node(
++        num = num,
++        user =
++        org.meshtastic.proto.User(
++            id = "!" + num.toUInt().toString(16).padStart(8, '0'),
++            short_name = "R${num and 0xff}",
++            long_name = "Radio $num",
++            hw_model = org.meshtastic.proto.HardwareModel.TBEAM,
++        ),
++        position = org.meshtastic.proto.Position(latitude_i = latitudeI, longitude_i = LON),
++        lastHeard = heardAt.epochSeconds.toInt(),
++    )
++
++    private fun myNodeInfo(num: Int) = org.meshtastic.core.model.MyNodeInfo(
++        myNodeNum = num,
++        hasGPS = false,
++        model = null,
++        firmwareVersion = "2.8.0",
++        couldUpdate = false,
++        shouldUpdate = false,
++        currentPacketId = 1L,
++        messageTimeoutMsec = 5000,
++        minAppVersion = 1,
++        maxChannels = 8,
++        hasWifi = false,
++        channelUtilization = 0f,
++        airUtilTx = 0f,
++        deviceId = null,
++    )
++
++    private companion object {
++        const val DOG = 0x0000d06d
++        const val OURS = 0x00000c0c
++        const val RELAY = 0x0000beef
++        const val LAT = 377_749_000
++        const val LON = -1_224_194_000
++
++    }
++}
+diff --git a/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/MeshNodeCoTConversionTest.kt b/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/MeshNodeCoTConversionTest.kt
+index 5ffef6a..8ec8857 100644
+--- a/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/MeshNodeCoTConversionTest.kt
++++ b/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/MeshNodeCoTConversionTest.kt
+@@ -134,8 +134,7 @@ class MeshNodeCoTConversionTest {
+         assertEquals("MESHTASTIC-A1B2C3D4", cot.uid)
+         assertEquals(DEFAULT_PLI_COT_TYPE, cot.type)
+         assertEquals("WOLF - Wolf Ridge Relay", cot.contact?.callsign)
+-        assertEquals(MESH_NODE_TAK_TEAM, cot.group?.name)
+-        assertEquals(DEFAULT_TAK_ROLE_NAME, cot.group?.role)
++        assertNull(cot.group, "mesh radios carry no TAK team so ATAK draws the 2525 symbol, not a team dot")
+         assertEquals(76, cot.status?.battery)
+         assertEquals(MESH_NODE_STALE_MINUTES.minutes, cot.stale - cot.time)
+         assertEquals(37.7749, cot.latitude, absoluteTolerance = 1e-6)
+diff --git a/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/TakDirectedRouterTest.kt b/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/TakDirectedRouterTest.kt
+new file mode 100644
+index 0000000..bb4b06b
+--- /dev/null
++++ b/core/takserver/src/commonTest/kotlin/org/meshtastic/core/takserver/TakDirectedRouterTest.kt
+@@ -0,0 +1,183 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++package org.meshtastic.core.takserver
++
++import org.meshtastic.tak.TakPacketV2Data
++import kotlin.test.Test
++import kotlin.test.assertEquals
++import kotlin.test.assertFalse
++import kotlin.test.assertNull
++import kotlin.test.assertTrue
++import kotlin.time.Duration.Companion.minutes
++import kotlin.time.Instant
++
++class TakDirectedRouterTest {
++
++    private var clock = Instant.fromEpochSeconds(1_000_000)
++    private fun router() = TakDirectedRouter(peerTtl = 30.minutes, now = { clock })
++
++    private val nodeA = 0x0a0a0a0a
++    private val nodeB = 0x0b0b0b0b
++    private val nodeMe = 0x0c0c0c0c
++
++    private fun pli(uid: String, callsign: String) =
++        TakPacketV2Data(cotTypeStr = "a-f-G-U-C", uid = uid, callsign = callsign, payload = TakPacketV2Data.Payload.Pli())
++
++    private fun dm(fromUid: String, toUid: String, toCallsign: String?) = TakPacketV2Data(
++        cotTypeStr = "b-t-f",
++        uid = "GeoChat.$fromUid.$toUid.abc123",
++        marti = listOfNotNull(toCallsign),
++        payload = TakPacketV2Data.Payload.Chat(message = "hi", to = toUid),
++    )
++
++    private fun allChat(fromUid: String) = TakPacketV2Data(
++        cotTypeStr = "b-t-f",
++        uid = "GeoChat.$fromUid.All Chat Rooms.m1",
++        payload = TakPacketV2Data.Payload.Chat(message = "hi all", to = null),
++    )
++
++    @Test
++    fun `recipients extracted from DM and broadcast chat`() {
++        val r = TakRecipients.of(dm("ANDROID-me", "ANDROID-a", "ALPHA"))
++        assertEquals(setOf("ANDROID-a"), r.uids)
++        assertEquals(setOf("ALPHA"), r.callsigns)
++        assertTrue(TakRecipients.of(allChat("ANDROID-me")).isBroadcast)
++        assertTrue(TakRecipients.of(pli("ANDROID-a", "ALPHA")).isBroadcast)
++    }
++
++    @Test
++    fun `DM to known peer is unicast to that node`() {
++        val r = router()
++        r.learnPeer(nodeA, pli("ANDROID-a", "ALPHA"))
++        assertEquals(nodeA, r.unicastTargetFor(TakRecipients.of(dm("ANDROID-me", "ANDROID-a", "ALPHA")), nodeMe))
++    }
++
++    @Test
++    fun `DM to unknown peer stays broadcast`() {
++        val r = router()
++        assertNull(r.unicastTargetFor(TakRecipients.of(dm("ANDROID-me", "ANDROID-a", "ALPHA")), nodeMe))
++    }
++
++    @Test
++    fun `stale peer mapping falls back to broadcast`() {
++        val r = router()
++        r.learnPeer(nodeA, pli("ANDROID-a", "ALPHA"))
++        clock += 31.minutes
++        assertNull(r.unicastTargetFor(TakRecipients.of(dm("ANDROID-me", "ANDROID-a", "ALPHA")), nodeMe))
++    }
++
++    @Test
++    fun `recipients on two different nodes stay broadcast`() {
++        val r = router()
++        r.learnPeer(nodeA, pli("ANDROID-a", "ALPHA"))
++        r.learnPeer(nodeB, pli("ANDROID-b", "BRAVO"))
++        val group = TakRecipients(uids = setOf("team-room"), callsigns = setOf("ALPHA", "BRAVO"))
++        assertNull(r.unicastTargetFor(group, nodeMe))
++    }
++
++    @Test
++    fun `peer that moved radios is unicast to the newest node`() {
++        val r = router()
++        r.learnPeer(nodeA, pli("ANDROID-a", "ALPHA"))
++        r.learnPeer(nodeB, pli("ANDROID-a", "ALPHA"))
++        assertEquals(nodeB, r.unicastTargetFor(TakRecipients.of(dm("ANDROID-me", "ANDROID-a", "ALPHA")), nodeMe))
++    }
++
++    @Test
++    fun `never unicast to our own node`() {
++        val r = router()
++        r.learnPeer(nodeMe, pli("ANDROID-a", "ALPHA"))
++        assertNull(r.unicastTargetFor(TakRecipients.of(dm("ANDROID-x", "ANDROID-a", "ALPHA")), nodeMe))
++    }
++
++    @Test
++    fun `peer learned from GeoChat sender uid`() {
++        val r = router()
++        r.learnPeer(nodeA, dm("ANDROID-a", "ANDROID-me", "ME"))
++        assertEquals(nodeA, r.unicastTargetFor(TakRecipients(setOf("ANDROID-a"), emptySet()), nodeMe))
++    }
++
++    @Test
++    fun `DM addressed to me is delivered`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        assertTrue(r.shouldDeliverLocally(TakRecipients.of(dm("ANDROID-a", "ANDROID-me", "ME"))))
++    }
++
++    @Test
++    fun `DM addressed to someone else by marti is dropped`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        assertFalse(r.shouldDeliverLocally(TakRecipients.of(dm("ANDROID-a", "ANDROID-b", "BRAVO"))))
++    }
++
++    @Test
++    fun `DM to known other peer without marti is dropped`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        r.learnPeer(nodeB, pli("ANDROID-b", "BRAVO"))
++        assertFalse(r.shouldDeliverLocally(TakRecipients.of(dm("ANDROID-a", "ANDROID-b", null))))
++    }
++
++    @Test
++    fun `unknown room without marti is delivered as stock behaviour`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        assertTrue(r.shouldDeliverLocally(TakRecipients(setOf("Cyan"), emptySet())))
++    }
++
++    @Test
++    fun `group message listing me in marti is delivered`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        assertTrue(r.shouldDeliverLocally(TakRecipients(setOf("team-room"), setOf("ALPHA", "ME"))))
++    }
++
++    @Test
++    fun `everything delivered before local ATAK identifies itself`() {
++        val r = router()
++        assertTrue(r.shouldDeliverLocally(TakRecipients.of(dm("ANDROID-a", "ANDROID-b", "BRAVO"))))
++    }
++
++    @Test
++    fun `broadcast traffic always delivered`() {
++        val r = router()
++        r.learnLocal("ANDROID-me", "ME")
++        assertTrue(r.shouldDeliverLocally(TakRecipients.of(allChat("ANDROID-a"))))
++        assertTrue(r.shouldDeliverLocally(TakRecipients.of(pli("ANDROID-a", "ALPHA"))))
++    }
++
++    @Test
++    fun `client nodes are radios a TAK client was heard from recently`() {
++        val r = router()
++        r.learnPeer(nodeA, pli("ANDROID-a", "ALPHA"))
++        r.learnPeer(nodeB, dm("ANDROID-b", "ANDROID-a", "ALPHA"))
++        assertEquals(setOf(nodeA, nodeB), r.clientNodes())
++        clock += 31.minutes
++        assertTrue(r.clientNodes().isEmpty(), "stale clients drop out")
++    }
++
++    @Test
++    fun `peer table is bounded`() {
++        val r = TakDirectedRouter(maxPeers = 2, now = { clock })
++        r.learnPeer(nodeA, pli("u1", "C1"))
++        r.learnPeer(nodeA, pli("u2", "C2"))
++        r.learnPeer(nodeB, pli("u3", "C3"))
++        assertNull(r.unicastTargetFor(TakRecipients(setOf("u1"), emptySet()), nodeMe), "oldest evicted")
++        assertEquals(nodeB, r.unicastTargetFor(TakRecipients(setOf("u3"), emptySet()), nodeMe))
++    }
++}
+diff --git a/core/testing/src/commonMain/kotlin/org/meshtastic/core/testing/FakeAppPreferences.kt b/core/testing/src/commonMain/kotlin/org/meshtastic/core/testing/FakeAppPreferences.kt
+index 860122c..2a33223 100644
+--- a/core/testing/src/commonMain/kotlin/org/meshtastic/core/testing/FakeAppPreferences.kt
++++ b/core/testing/src/commonMain/kotlin/org/meshtastic/core/testing/FakeAppPreferences.kt
+@@ -504,4 +504,71 @@ class FakeTakPrefs : org.meshtastic.core.repository.TakPrefs {
+     override fun setTakServerChannel(index: Int) {
+         takServerChannel.value = index
+     }
++
++    override val meshToCotRadioMode =
++        MutableStateFlow(org.meshtastic.core.repository.MeshToCotRadioMode.RADIOS_AND_CLIENTS)
++
++    override fun setMeshToCotRadioMode(mode: org.meshtastic.core.repository.MeshToCotRadioMode) {
++        meshToCotRadioMode.value = mode
++    }
++
++    override val meshToCotMaxAgeMinutes =
++        MutableStateFlow(org.meshtastic.core.repository.TakPrefs.DEFAULT_MESH_TO_COT_MAX_AGE_MINUTES)
++
++    override fun setMeshToCotMaxAgeMinutes(minutes: Int) {
++        meshToCotMaxAgeMinutes.value = minutes
++    }
++
++    override val meshToCotOnlySelected = MutableStateFlow(false)
++
++    override fun setMeshToCotOnlySelected(onlySelected: Boolean) {
++        meshToCotOnlySelected.value = onlySelected
++    }
++
++    override val meshToCotShownNodes = MutableStateFlow<Set<Int>>(emptySet())
++
++    override fun setMeshToCotShownNodes(nodes: Set<Int>) {
++        meshToCotShownNodes.value = nodes
++    }
++
++    override val breadcrumbNodes = MutableStateFlow<Set<Int>>(emptySet())
++
++    override fun setBreadcrumbNodes(nodes: Set<Int>) {
++        breadcrumbNodes.value = nodes
++    }
++
++    override val takUserMaxAgeMinutes =
++        MutableStateFlow(org.meshtastic.core.repository.TakPrefs.DEFAULT_TAK_USER_MAX_AGE_MINUTES)
++
++    override fun setTakUserMaxAgeMinutes(minutes: Int) {
++        takUserMaxAgeMinutes.value = minutes
++    }
++
++    override val breadcrumbMinDistanceMeters =
++        MutableStateFlow(org.meshtastic.core.repository.TakPrefs.DEFAULT_BREADCRUMB_MIN_DISTANCE_METERS)
++
++    override fun setBreadcrumbMinDistanceMeters(meters: Int) {
++        breadcrumbMinDistanceMeters.value = meters
++    }
++
++    override val breadcrumbIntervalSeconds =
++        MutableStateFlow(org.meshtastic.core.repository.TakPrefs.DEFAULT_BREADCRUMB_INTERVAL_SECONDS)
++
++    override fun setBreadcrumbIntervalSeconds(seconds: Int) {
++        breadcrumbIntervalSeconds.value = seconds
++    }
++
++    override val breadcrumbKeepMinutes =
++        MutableStateFlow(org.meshtastic.core.repository.TakPrefs.DEFAULT_BREADCRUMB_KEEP_MINUTES)
++
++    override fun setBreadcrumbKeepMinutes(minutes: Int) {
++        breadcrumbKeepMinutes.value = minutes
++    }
++
++    override val breadcrumbColorArgb =
++        MutableStateFlow(org.meshtastic.core.repository.TakPrefs.DEFAULT_BREADCRUMB_COLOR_ARGB)
++
++    override fun setBreadcrumbColorArgb(argb: Int) {
++        breadcrumbColorArgb.value = argb
++    }
+ }
+diff --git a/feature/settings/src/commonMain/kotlin/org/meshtastic/feature/settings/radio/component/MeshToCotRadiosCard.kt b/feature/settings/src/commonMain/kotlin/org/meshtastic/feature/settings/radio/component/MeshToCotRadiosCard.kt
+new file mode 100644
+index 0000000..89ec46e
+--- /dev/null
++++ b/feature/settings/src/commonMain/kotlin/org/meshtastic/feature/settings/radio/component/MeshToCotRadiosCard.kt
+@@ -0,0 +1,317 @@
++/*
++ * Copyright (c) 2026 Meshtastic LLC
++ *
++ * This program is free software: you can redistribute it and/or modify
++ * it under the terms of the GNU General Public License as published by
++ * the Free Software Foundation, either version 3 of the License, or
++ * (at your option) any later version.
++ *
++ * This program is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
++ * GNU General Public License for more details.
++ *
++ * You should have received a copy of the GNU General Public License
++ * along with this program.  If not, see <https://www.gnu.org/licenses/>.
++ */
++@file:Suppress("LongMethod", "MagicNumber")
++
++package org.meshtastic.feature.settings.radio.component
++
++import androidx.compose.foundation.clickable
++import androidx.compose.foundation.layout.Column
++import androidx.compose.foundation.layout.Row
++import androidx.compose.foundation.layout.fillMaxWidth
++import androidx.compose.foundation.layout.heightIn
++import androidx.compose.foundation.layout.padding
++import androidx.compose.foundation.layout.width
++import androidx.compose.foundation.lazy.LazyColumn
++import androidx.compose.foundation.lazy.items
++import androidx.compose.material3.AlertDialog
++import androidx.compose.material3.Checkbox
++import androidx.compose.material3.HorizontalDivider
++import androidx.compose.material3.MaterialTheme
++import androidx.compose.material3.Text
++import androidx.compose.material3.TextButton
++import androidx.compose.runtime.Composable
++import androidx.compose.runtime.getValue
++import androidx.compose.runtime.mutableStateOf
++import androidx.compose.runtime.remember
++import androidx.compose.runtime.setValue
++import androidx.compose.ui.Alignment
++import androidx.compose.ui.Modifier
++import androidx.compose.ui.text.style.TextAlign
++import androidx.compose.ui.text.style.TextOverflow
++import androidx.compose.ui.unit.dp
++import androidx.lifecycle.compose.collectAsStateWithLifecycle
++import org.koin.compose.koinInject
++import org.meshtastic.core.model.Node
++import org.meshtastic.core.repository.MeshToCotRadioMode
++import org.meshtastic.core.repository.NodeRepository
++import org.meshtastic.core.repository.TakPrefs
++import org.meshtastic.core.ui.component.DropDownPreference
++import org.meshtastic.core.ui.component.SwitchPreference
++import org.meshtastic.core.ui.component.TitledCard
++
++// ── Mesh to CoT radio picker + breadcrumb trail settings ────────────────────
++// Which radios appear on the TAK map, and which ones leave a trail of spot-map dots.
++
++private val RADIO_MODE_OPTIONS =
++    listOf(
++        MeshToCotRadioMode.RADIOS_AND_CLIENTS to "Radios + clients",
++        MeshToCotRadioMode.CLIENTS_ONLY to "Clients only",
++        MeshToCotRadioMode.CLIENTS_AND_RADIOS_WITHOUT_CLIENT to "Clients + radios without a client",
++    )
++
++private fun radioModeSummary(mode: MeshToCotRadioMode): String = when (mode) {
++    MeshToCotRadioMode.RADIOS_AND_CLIENTS -> "Every radio marker, plus TAK users"
++    MeshToCotRadioMode.CLIENTS_ONLY -> "Only TAK users; no radio markers (trail radios still show)"
++    MeshToCotRadioMode.CLIENTS_AND_RADIOS_WITHOUT_CLIENT ->
++        "TAK users, plus radios nobody's TAK client is on (e.g. a tracker)"
++}
++
++private val MAX_AGE_OPTIONS =
++    listOf(10 to "10 minutes", 15 to "15 minutes", 30 to "30 minutes", 60 to "1 hour", 120 to "2 hours")
++
++private val TRAIL_INTERVAL_OPTIONS =
++    listOf(60 to "1 minute", 120 to "2 minutes", 300 to "5 minutes", 600 to "10 minutes")
++
++private val TRAIL_KEEP_OPTIONS =
++    listOf(
++        60 to "1 hour",
++        180 to "3 hours",
++        360 to "6 hours",
++        720 to "12 hours",
++        1440 to "24 hours",
++        TakPrefs.BREADCRUMB_KEEP_FOREVER to "Forever (saved in TAK)",
++    )
++
++private val TRAIL_DISTANCE_OPTIONS = listOf(0 to "Any movement", 10 to "10 m", 25 to "25 m", 50 to "50 m", 100 to "100 m")
++
++private val TAK_USER_MAX_AGE_OPTIONS =
++    listOf(0 to "Never (stock)", 10 to "10 minutes", 15 to "15 minutes", 30 to "30 minutes", 60 to "1 hour", 120 to "2 hours")
++
++// ATAK spot-map colours as signed ARGB ints (ATAK's own encoding, e.g. red = -65536).
++private val TRAIL_COLOR_OPTIONS =
++    listOf(
++        0xFFFF0000.toInt() to "Red",
++        0xFFFFFF00.toInt() to "Yellow",
++        0xFFFF7F00.toInt() to "Orange",
++        0xFFFF00FF.toInt() to "Magenta",
++        0xFF00FFFF.toInt() to "Cyan",
++        0xFFFFFFFF.toInt() to "White",
++    )
++
++/** Keeps a dropdown valid when the saved value isn't one of the presets. */
++private fun <T> List<Pair<T, String>>.withCurrent(current: T): List<Pair<T, String>> =
++    if (any { it.first == current }) this else this + (current to current.toString())
++
++@Composable
++internal fun MeshToCotRadiosCard() {
++    val takPrefs: TakPrefs = koinInject()
++    val nodeRepository: NodeRepository = koinInject()
++    val radioMode by takPrefs.meshToCotRadioMode.collectAsStateWithLifecycle()
++    val onlySelected by takPrefs.meshToCotOnlySelected.collectAsStateWithLifecycle()
++    val maxAgeMinutes by takPrefs.meshToCotMaxAgeMinutes.collectAsStateWithLifecycle()
++    val shown by takPrefs.meshToCotShownNodes.collectAsStateWithLifecycle()
++    val trailNodes by takPrefs.breadcrumbNodes.collectAsStateWithLifecycle()
++    val interval by takPrefs.breadcrumbIntervalSeconds.collectAsStateWithLifecycle()
++    val keepMinutes by takPrefs.breadcrumbKeepMinutes.collectAsStateWithLifecycle()
++    val minDistance by takPrefs.breadcrumbMinDistanceMeters.collectAsStateWithLifecycle()
++    val color by takPrefs.breadcrumbColorArgb.collectAsStateWithLifecycle()
++    val nodesByNum by nodeRepository.nodeDBbyNum.collectAsStateWithLifecycle()
++    val myNodeInfo by nodeRepository.myNodeInfo.collectAsStateWithLifecycle()
++    var showPicker by remember { mutableStateOf(false) }
++
++    val ourNum = myNodeInfo?.myNodeNum
++    val radios =
++        nodesByNum.values
++            .filter { it.num != ourNum && !it.isUnknownUser }
++            .sortedBy { radioName(it).lowercase() }
++
++    TitledCard(title = "Mesh to CoT radios") {
++        DropDownPreference(
++            title = "Show on map",
++            summary = radioModeSummary(radioMode),
++            enabled = true,
++            items = RADIO_MODE_OPTIONS,
++            selectedItem = radioMode,
++            onItemSelected = { takPrefs.setMeshToCotRadioMode(it) },
++        )
++        HorizontalDivider()
++        DropDownPreference(
++            title = "Remove radios not heard for",
++            summary = "Their marker is deleted from the TAK map; it comes back when the radio is heard again",
++            enabled = true,
++            items = MAX_AGE_OPTIONS.withCurrent(maxAgeMinutes),
++            selectedItem = maxAgeMinutes,
++            onItemSelected = { takPrefs.setMeshToCotMaxAgeMinutes(it) },
++        )
++        HorizontalDivider()
++        SwitchPreference(
++            title = "Only show selected radios",
++            summary = if (onlySelected) "Only radios you pick appear on the TAK map" else "All radios appear on the TAK map",
++            checked = onlySelected,
++            enabled = true,
++            onCheckedChange = { takPrefs.setMeshToCotOnlySelected(it) },
++        )
++        HorizontalDivider()
++        Column(modifier = Modifier.fillMaxWidth().clickable { showPicker = true }.padding(16.dp)) {
++            Text(text = "Choose radios", style = MaterialTheme.typography.bodyLarge)
++            Text(
++                text = "${shown.size} picked to show · ${trailNodes.size} with a breadcrumb trail",
++                style = MaterialTheme.typography.bodySmall,
++                color = MaterialTheme.colorScheme.onSurfaceVariant,
++            )
++        }
++        HorizontalDivider()
++        DropDownPreference(
++            title = "Trail: drop a dot every",
++            summary = "Only when the radio has moved since its last dot",
++            enabled = true,
++            // A trail can't be finer than a radio's 1-minute minimum position broadcast; older saved values
++            // below that are shown (and applied) as 1 minute.
++            items = TRAIL_INTERVAL_OPTIONS.withCurrent(interval.coerceAtLeast(60)),
++            selectedItem = interval.coerceAtLeast(60),
++            onItemSelected = { takPrefs.setBreadcrumbIntervalSeconds(it) },
++        )
++        HorizontalDivider()
++        DropDownPreference(
++            title = "Trail: only after moving at least",
++            summary = "Stops GPS jitter scattering dots while the radio sits still",
++            enabled = true,
++            items = TRAIL_DISTANCE_OPTIONS.withCurrent(minDistance),
++            selectedItem = minDistance,
++            onItemSelected = { takPrefs.setBreadcrumbMinDistanceMeters(it) },
++        )
++        HorizontalDivider()
++        DropDownPreference(
++            title = "Trail: keep dots for",
++            enabled = true,
++            items = TRAIL_KEEP_OPTIONS.withCurrent(keepMinutes),
++            selectedItem = keepMinutes,
++            onItemSelected = { takPrefs.setBreadcrumbKeepMinutes(it) },
++        )
++        HorizontalDivider()
++        DropDownPreference(
++            title = "Trail: dot colour",
++            enabled = true,
++            items = TRAIL_COLOR_OPTIONS.withCurrent(color),
++            selectedItem = color,
++            onItemSelected = { takPrefs.setBreadcrumbColorArgb(it) },
++        )
++    }
++
++    if (showPicker) {
++        RadioPickerDialog(
++            radios = radios,
++            shown = shown,
++            trailNodes = trailNodes,
++            onShownChange = { num, on -> takPrefs.setMeshToCotShownNodes(if (on) shown + num else shown - num) },
++            onTrailChange = { num, on -> takPrefs.setBreadcrumbNodes(if (on) trailNodes + num else trailNodes - num) },
++            onDismiss = { showPicker = false },
++        )
++    }
++}
++
++private fun radioName(node: Node): String {
++    val long = node.user.long_name.trim()
++    val short = node.user.short_name.trim()
++    return when {
++        long.isNotEmpty() -> long
++        short.isNotEmpty() -> short
++        else -> "!" + node.num.toUInt().toString(16).padStart(8, '0')
++    }
++}
++
++@Composable
++private fun RadioPickerDialog(
++    radios: List<Node>,
++    shown: Set<Int>,
++    trailNodes: Set<Int>,
++    onShownChange: (Int, Boolean) -> Unit,
++    onTrailChange: (Int, Boolean) -> Unit,
++    onDismiss: () -> Unit,
++) {
++    AlertDialog(
++        onDismissRequest = onDismiss,
++        confirmButton = { TextButton(onClick = onDismiss) { Text("Done") } },
++        title = { Text("Choose radios") },
++        text = {
++            Column {
++                Text(
++                    text = "Show: put this radio on the TAK map (used when \"Only show selected radios\" is on). " +
++                        "Trail: drop a breadcrumb dot as it moves (always shown).",
++                    style = MaterialTheme.typography.bodySmall,
++                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                )
++                Row(modifier = Modifier.fillMaxWidth().padding(top = 12.dp), verticalAlignment = Alignment.CenterVertically) {
++                    Text("Radio", modifier = Modifier.weight(1f), style = MaterialTheme.typography.labelLarge)
++                    Text("Show", modifier = Modifier.width(56.dp), textAlign = TextAlign.Center, style = MaterialTheme.typography.labelLarge)
++                    Text("Trail", modifier = Modifier.width(56.dp), textAlign = TextAlign.Center, style = MaterialTheme.typography.labelLarge)
++                }
++                HorizontalDivider()
++                if (radios.isEmpty()) {
++                    Text(
++                        text = "No radios heard yet. Connect to your radio and wait for the node list to fill in.",
++                        modifier = Modifier.padding(vertical = 12.dp),
++                        style = MaterialTheme.typography.bodyMedium,
++                    )
++                }
++                LazyColumn(modifier = Modifier.heightIn(max = 420.dp)) {
++                    items(radios, key = { it.num }) { node ->
++                        val hasTrail = node.num in trailNodes
++                        Row(modifier = Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
++                            Column(modifier = Modifier.weight(1f).padding(vertical = 6.dp)) {
++                                Text(
++                                    text = radioName(node),
++                                    style = MaterialTheme.typography.bodyLarge,
++                                    maxLines = 1,
++                                    overflow = TextOverflow.Ellipsis,
++                                )
++                                val detail =
++                                    buildString {
++                                        append(node.user.short_name.trim())
++                                        if (node.validPosition == null) append(" · no position yet")
++                                    }
++                                Text(
++                                    text = detail,
++                                    style = MaterialTheme.typography.bodySmall,
++                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
++                                )
++                            }
++                            Checkbox(
++                                checked = node.num in shown || hasTrail,
++                                enabled = !hasTrail,
++                                onCheckedChange = { onShownChange(node.num, it) },
++                                modifier = Modifier.width(56.dp),
++                            )
++                            Checkbox(
++                                checked = hasTrail,
++                                onCheckedChange = { onTrailChange(node.num, it) },
++                                modifier = Modifier.width(56.dp),
++                            )
++                        }
++                    }
++                }
++            }
++        },
++    )
++}
++
++/** Clean-up of remote TAK users (other people's ATAK/WinTAK icons heard over the mesh). */
++@Composable
++internal fun TakUsersCard() {
++    val takPrefs: TakPrefs = koinInject()
++    val maxAge by takPrefs.takUserMaxAgeMinutes.collectAsStateWithLifecycle()
++    TitledCard(title = "TAK users") {
++        DropDownPreference(
++            title = "Remove TAK users not heard for",
++            summary = "Deletes a quiet user's icon instead of leaving it greyed out; it returns when they're heard",
++            enabled = true,
++            items = TAK_USER_MAX_AGE_OPTIONS.withCurrent(maxAge),
++            selectedItem = maxAge,
++            onItemSelected = { takPrefs.setTakUserMaxAgeMinutes(it) },
++        )
++    }
++}
+diff --git a/feature/settings/src/commonMain/kotlin/org/meshtastic/feature/settings/radio/component/TAKConfigItemList.kt b/feature/settings/src/commonMain/kotlin/org/meshtastic/feature/settings/radio/component/TAKConfigItemList.kt
+index 6c0a2e7..025091c 100644
+--- a/feature/settings/src/commonMain/kotlin/org/meshtastic/feature/settings/radio/component/TAKConfigItemList.kt
++++ b/feature/settings/src/commonMain/kotlin/org/meshtastic/feature/settings/radio/component/TAKConfigItemList.kt
+@@ -26,6 +26,8 @@ import androidx.compose.foundation.layout.Row
+ import androidx.compose.foundation.layout.fillMaxWidth
+ import androidx.compose.foundation.layout.padding
+ import androidx.compose.foundation.layout.size
++import androidx.compose.foundation.rememberScrollState
++import androidx.compose.foundation.verticalScroll
+ import androidx.compose.foundation.shape.CircleShape
+ import androidx.compose.material3.Button
+ import androidx.compose.material3.CircularProgressIndicator
+@@ -233,6 +235,7 @@ fun TakServerScreen(onBack: () -> Unit) {
+     val isTakServerStarting by takServerManager.isStarting.collectAsStateWithLifecycle()
+     val takClientCount by takServerManager.connectionCount.collectAsStateWithLifecycle()
+     val hasTakServerStartError by takServerManager.hasStartError.collectAsStateWithLifecycle()
++    val takServerStartErrorReason by takServerManager.startErrorReason.collectAsStateWithLifecycle()
+     val myNodeInfo by nodeRepository.myNodeInfo.collectAsStateWithLifecycle()
+     // The Mesh-to-CoT bridge falls back to a legacy protocol (PLI + basic chat only, no
+     // markers/POIs) when the connected node's firmware predates the v2 TAK port — see
+@@ -283,7 +286,7 @@ fun TakServerScreen(onBack: () -> Unit) {
+             )
+         },
+     ) { padding ->
+-        Column(modifier = Modifier.padding(padding).padding(horizontal = 16.dp)) {
++        Column(modifier = Modifier.padding(padding).verticalScroll(rememberScrollState()).padding(horizontal = 16.dp)) {
+             TakServerSection(
+                 isTakServerEnabled = isTakServerEnabled,
+                 onEnabledChange = { takPrefs.setTakServerEnabled(it) },
+@@ -296,7 +299,14 @@ fun TakServerScreen(onBack: () -> Unit) {
+                 clientCount = takClientCount,
+                 onExport = { exportLauncher("Meshtastic_TAK_Server.zip") },
+                 supportsTakV2 = supportsTakV2,
++                startErrorReason = takServerStartErrorReason,
+             )
++            if (isTakServerEnabled) {
++                TakUsersCard()
++            }
++            if (isTakServerEnabled && isMeshToCotEnabled) {
++                MeshToCotRadiosCard()
++            }
+             TakMeshTestCard()
+         }
+     }
+@@ -316,6 +326,7 @@ internal fun TakServerSection(
+     clientCount: Int,
+     onExport: () -> Unit,
+     supportsTakV2: Boolean,
++    startErrorReason: String? = null,
+ ) {
+     TitledCard(title = stringResource(Res.string.tak_server_section)) {
+         SwitchPreference(
+@@ -326,7 +337,7 @@ internal fun TakServerSection(
+             onCheckedChange = onEnabledChange,
+         )
+         HorizontalDivider()
+-        TakServerStatusRow(status = status, clientCount = clientCount)
++        TakServerStatusRow(status = status, clientCount = clientCount, errorReason = startErrorReason)
+         if (isTakServerEnabled) {
+             HorizontalDivider()
+             SwitchPreference(
+@@ -425,7 +436,7 @@ internal enum class TakServerStatus {
+ }
+ 
+ @Composable
+-private fun TakServerStatusRow(status: TakServerStatus, clientCount: Int) {
++private fun TakServerStatusRow(status: TakServerStatus, clientCount: Int, errorReason: String? = null) {
+     val (description, color) =
+         when (status) {
+             TakServerStatus.Unavailable ->
+@@ -445,7 +456,7 @@ private fun TakServerStatusRow(status: TakServerStatus, clientCount: Int) {
+                     MaterialTheme.colorScheme.primary
+ 
+             TakServerStatus.Failed ->
+-                stringResource(Res.string.tak_server_status_failed) to MaterialTheme.colorScheme.error
++                (errorReason ?: stringResource(Res.string.tak_server_status_failed)) to MaterialTheme.colorScheme.error
+ 
+             TakServerStatus.NotRunning ->
+                 stringResource(Res.string.tak_server_status_not_running) to MaterialTheme.colorScheme.onSurfaceVariant
+-- 
+2.43.0
+
