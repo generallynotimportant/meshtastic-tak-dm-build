@@ -1,4 +1,4 @@
-# Meshtastic TAK DM fix: build kit (v0.11)
+# Meshtastic TAK DM fix: build kit (v0.12)
 
 **BLUF:** This repo builds patched Meshtastic apps, for Android phones (ATAK) and Windows (WinTAK), straight from Meshtastic's official source. With the patch, TAK direct messages go only to the person they're for, and mesh radios show on the map as blue friendly symbols instead of green team dots. You can also pick which radios appear on the map, and give any radio a breadcrumb trail of dots (e.g. a dog's tracker).
 
@@ -6,7 +6,8 @@
 | Version | Change |
 |---|---|
 | v0.2 | A GeoChat DM is sent only to the recipient's radio when it's known, encrypted to that radio by firmware 2.5+. A DM that still arrives as a broadcast is dropped unless it's for this device's TAK user. All Chat is unchanged. |
-| v0.11 | WinTAK export fixed: one flat package you drag onto WinTAK, and the server settings file now declares XML 1.0. Before, WinTAK rejected it with **"Version number '1.1' is invalid"** and created no connection. |
+| v0.12 | Built on v0.9: **one** export button again (the WinTAK-only export from v0.10/v0.11 is gone). The exported server settings file now declares XML 1.0 so WinTAK can read it. |
+| v0.11 | (Dropped) WinTAK export fixed: one flat package you drag onto WinTAK, and the server settings file now declares XML 1.0. Before, WinTAK rejected it with **"Version number '1.1' is invalid"** and created no connection. |
 | v0.10 | **Export TAK Data Package for WinTAK** (TAK Server screen): a package WinTAK imports in one step, setting up the server and both certificates. Uses the nested layout FreeTAKServer builds for WinTAK. The regular ATAK export is unchanged. |
 | v0.9 | Radio markers are plain friendly ground (`a-f-G`, the generic blue symbol) instead of `a-f-G-U-C`, which ATAK labelled **CBT** (combat). |
 | v0.8 | Shortest trail interval is now **1 minute**. Field test: radios never reported positions faster than once a minute, even with Smart Position on, so the 30-second option never produced more dots. A saved 30-second setting now acts as 1 minute. |
@@ -21,7 +22,8 @@
 |---|---|
 | `.github/workflows/build-apk.yml` | Builds the Android app (APK). |
 | `.github/workflows/build-desktop-windows.yml` | Builds Meshtastic Desktop for Windows (MSI + EXE), used with WinTAK. |
-| `meshtastic-tak-directed-dm-v2.8.1-v0.11.patch` | Current patch for app version 2.8.1 (the default). |
+| `meshtastic-tak-directed-dm-v2.8.1-v0.12.patch` | Current patch for app version 2.8.1 (the default). |
+| `meshtastic-tak-directed-dm-v2.8.1-v0.11.patch` | Experiment: separate WinTAK export button. Not used. |
 | `meshtastic-tak-directed-dm-v2.8.1-v0.10.patch` | Same, with the WinTAK export that fails to import (kept for history). |
 | `meshtastic-tak-directed-dm-v2.8.1-v0.9.patch` | Same, without the WinTAK export. |
 | `meshtastic-tak-directed-dm-v2.8.1-v0.8.patch` | Same, with radios shown as CBT (combat). |
@@ -48,11 +50,11 @@
 ## Install: Windows PC (WinTAK)
 1. Install the `.msi` from the Windows build zip. It's unsigned, so if Windows warns: **More info → Run anyway**. It replaces any official Meshtastic Desktop install.
 2. Plug in the PC's radio by USB, connect to it in Meshtastic Desktop, and turn on the TAK server.
-3. In the TAK Server settings, tap **Export TAK Data Package for WinTAK** and save the zip.
-4. Drag the zip onto WinTAK (or use its Import). It adds the server connection (`127.0.0.1:8089`, SSL) and both certificates. The connection indicator turns green when it's connected.
-5. If you imported a broken package earlier, delete that half-made server entry in WinTAK first.
-
-**Manual fallback:** add a server `127.0.0.1`, port `8089`, SSL/TLS, and import `truststore.p12` (CA) and `client.p12` (client), both with password `meshtastic`. Use the regular (ATAK) export to get the two .p12 files.
+3. In the TAK Server settings, tap **Export TAK Data Package** and save the zip. Unzip it once: it holds `client.p12`, `truststore.p12`, a `.pref` and a `manifest.xml`.
+4. In WinTAK, add a new server connection:
+   - **Address:** `127.0.0.1`, **Port:** `8089`, **SSL/TLS**
+   - Import `truststore.p12` (CA) and `client.p12` (client certificate), both with password `meshtastic`.
+   - The connection indicator turns green when it's connected.
 
 ## Test (three stations, each with its own radio)
 1. Wait until every station shows on every other station's map. That's how each app learns which radio everyone is on.

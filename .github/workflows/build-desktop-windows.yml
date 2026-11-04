@@ -16,7 +16,7 @@ on:
       patch_file:
         description: "Patch file to apply (file name in this repo)"
         required: true
-        default: "meshtastic-tak-directed-dm-v2.8.1-v0.11.patch"
+        default: "meshtastic-tak-directed-dm-v2.8.1-v0.12.patch"
 
 permissions:
   contents: read
